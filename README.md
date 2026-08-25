@@ -2,6 +2,11 @@
 
 For continuation on a Mac with Xcode 26.6, see [HANDOFF-macOS26.md](HANDOFF-macOS26.md).
 
+The sanitized SideStore-ready IPA is available from the public
+[`v0.0.1-sidestore.1` prerelease](https://github.com/hernan0078/MagnusPS5/releases/tag/v0.0.1-sidestore.1).
+It is an unofficial repackaging of the upstream binary, not a source-reproduced build. Read the
+release notes and signing limitations before installing it.
+
 This fork tracks [BaconMakin/MagnusPS5](https://github.com/BaconMakin/MagnusPS5) and adds
 repeatable checks for game folders and signed iOS packages. Magnus is experimental. Upstream's
 `0.0.1` release says that only a limited number of games work and that it was built and tested for
