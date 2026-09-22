@@ -19,9 +19,11 @@
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/HostFeatures.h>
 #include <FEXCore/Core/SignalDelegator.h>
+#include <FEXCore/Core/Thunks.h>
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
+#include <FEXCore/IR/IR.h>
 #include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/DualMap.h>
 #include <FEXCore/Utils/LogManager.h>
@@ -60,6 +62,7 @@ std::atomic<uint64_t> g_segv_count {0};
 std::atomic<uint64_t> g_bus_count {0};
 std::atomic<uint64_t> g_unaligned_count {0};
 std::atomic<uint64_t> g_host_call_faults {0};
+std::atomic<uint64_t> g_thunk_queries {0};
 
 // --- FEXCore objects --------------------------------------------------------
 
@@ -140,9 +143,32 @@ MagnusSyscallHandler g_syscall_handler;
 
 class MagnusSignalDelegator : public FEXCore::SignalDelegator {
 public:
-	// Base defaults stand; faults observed here are counted by the reporter
-	// below via sigaction chaining installed after FEX takes its handlers.
+	// Base defaults stand; per-signal attribution is observed through the
+	// HLE-trap registry below once guest code runs on device.
 };
+
+// --- HLE-trap registry (guest -> Kyty host calls) --------------------------
+//
+// Problem: Kyty resolves imported NIDs to host function addresses in the
+// guest GOT. Translated guest code calling those addresses would execute
+// host ARM64 bytes as x86. Full fix: per-NID x86 trap stubs + marshaling
+// (ThunkLibs-style), driven by on-device traces of which NIDs each title
+// actually calls. This registry is the observation + dispatch point:
+//   - LookupThunk logs the IR hash FEX asks about (identifies trap stubs
+//     once RunEntry-side stubs are emitted);
+//   - NoteHostCallTarget records fault RIPs inside host mappings so the
+//     game view can report WHICH import is missing instead of dying silent.
+class MagnusThunkObserver : public FEXCore::ThunkHandler {
+public:
+	FEXCore::ThunkedFunction* LookupThunk(const FEXCore::IR::SHA256Sum& sha) override {
+		(void)sha;
+		g_thunk_queries.fetch_add(1, std::memory_order_relaxed);
+		LOGF("[FEX] thunk query (no trap stubs emitted yet)\n");
+		return nullptr;
+	}
+};
+
+MagnusThunkObserver g_thunk_observer;
 
 // A19 Pro host features. Conservative set proven on Apple Silicon (no SVE;
 // AVX falls back to 128-bit ASIMD in FEX). MIDR read from the hardware with
@@ -220,6 +246,7 @@ bool FexInitOnce(std::string& failure) {
 	static MagnusSignalDelegator delegator;
 	g_ctx->SetSignalDelegator(&delegator);
 	g_ctx->SetSyscallHandler(&g_syscall_handler);
+	g_ctx->SetThunkHandler(&g_thunk_observer);
 	g_ctx->SetHardwareTSOSupport(true);
 	try {
 		if (!g_ctx->InitCore()) {

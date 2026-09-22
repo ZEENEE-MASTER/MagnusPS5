@@ -62,7 +62,7 @@ jobs:
 
       - name: Build FEX for iphoneos (provides libFEXCore.a etc.)
         run: |
-          pip3 install --quiet packaging setuptools
+          pip3 install --quiet --break-system-packages packaging setuptools
           cd ../FEX
           cmake -S . -B build-iphoneos -G Ninja \
             -DCMAKE_SYSTEM_NAME=iOS \
