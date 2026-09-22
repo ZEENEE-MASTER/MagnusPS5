@@ -38,8 +38,12 @@ namespace Libs::Graphics {
 
 namespace {
 
-// Magnus iOS stats (ported). TODO: wire increments at CreatePipelineInternal
-// sites after iOS Actions build validates Kyty Sep-20 pipeline flow.
+// Magnus iOS stats (ported from MagnusPS5 origin/main pipelineCache.cpp:24-44,
+// Record sites ex-:241/:322 incl. autosave every 4 creates). Kyty Sep-20
+// restructured pipeline creation (no CreateGraphicsPipeline/pipeline_start
+// match), so increments are intentionally unwired until the macOS iOS-core
+// build exposes the new creation sites. Getters return 0 so magnus_stats()
+// links.
 std::atomic<uint64_t> g_pipeline_create_count {0};
 std::atomic<uint64_t> g_pipeline_create_microseconds {0};
 

@@ -58,16 +58,28 @@ jobs:
         run: |
           mkdir -p ../MoltenVK
           cd ../MoltenVK
-          curl -L -o moltenvk.tar https://github.com/KhronosGroup/MoltenVK/releases/download/v${{ env.MOLTENVK_VERSION }}/MoltenVK-macos.tar
-          tar xf moltenvk.tar
-          find . -name "libMoltenVK.a" | head
-          find . -name "mvk_private_api.h" | head
+          # NOTE: macos.tar only ships macos-arm64 slices. iOS needs ios-arm64.
+          curl -L -o moltenvk-ios.tar https://github.com/KhronosGroup/MoltenVK/releases/download/v${{ env.MOLTENVK_VERSION }}/MoltenVK-ios.tar
+          tar xf moltenvk-ios.tar
+          echo "--- libMoltenVK.a candidates ---"
+          find . -name "libMoltenVK.a"
+          echo "--- mvk_private_api.h candidates ---"
+          find . -name "mvk_private_api.h"
+          # Fail fast if the iOS slice is missing (do NOT silently use a macOS slice).
+          if ! find . -path "*ios-arm64*libMoltenVK.a" | grep -q .; then
+            echo "ERROR: ios-arm64/libMoltenVK.a not found in MoltenVK-ios.tar" >&2
+            exit 1
+          fi
 
       - name: Configure (iphoneos arm64, Release)
         run: |
-          MOLTENVK_LIB=$(find ../MoltenVK -name "libMoltenVK.a" | head -n 1)
-          MOLTENVK_INC=$(dirname $(find ../MoltenVK -name "mvk_private_api.h" | head -n 1) | xargs dirname | xargs dirname)
+          MOLTENVK_LIB=$(find ../MoltenVK -path "*ios-arm64*libMoltenVK.a" | head -n 1)
+          MVK_HEADER=$(find ../MoltenVK -name "mvk_private_api.h" | head -n 1)
+          # Header lives at <root>/MoltenVK/mvk_private_api.h; include dir is <root>.
+          MOLTENVK_INC=$(dirname "$MVK_HEADER" | xargs dirname)
           echo "MoltenVK lib=$MOLTENVK_LIB inc=$MOLTENVK_INC"
+          test -f "$MOLTENVK_LIB" || { echo "ERROR: MoltenVK ios lib missing: $MOLTENVK_LIB" >&2; exit 1; }
+          test -f "$MOLTENVK_INC/MoltenVK/mvk_private_api.h" || { echo "ERROR: MoltenVK headers missing under: $MOLTENVK_INC" >&2; exit 1; }
           cmake -S . -B build-ios -G Ninja \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \

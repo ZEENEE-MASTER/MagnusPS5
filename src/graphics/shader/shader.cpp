@@ -65,10 +65,12 @@ struct ShaderBinaryInfo {
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMappedData>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
 
-// Magnus iOS stats (ported from MagnusPS5). TODO: wire Record increments at
-// shader compile finish sites (see Magnus shader.cpp RecordShaderCompile).
-// Getters currently return 0 so magnus_stats() links; counters to be wired
-// after iOS Actions build validates compile sites on Kyty Sep-20 base.
+// Magnus iOS stats (ported from MagnusPS5 origin/main shader.cpp:55-79,
+// Record sites ex-VS/PS/CS at :1175/:1216/:1254). Kyty Sep-20 restructured
+// shader compile around GetShaderParams + ShaderRecompiler (no
+// ShaderCompileInfoVS/PS/CS), so increments are intentionally unwired until
+// the macOS iOS-core build exposes the new compile-finish sites.
+// Getters return 0 so magnus_stats() links.
 namespace {
 std::atomic<uint64_t> g_shader_compile_count {0};
 std::atomic<uint64_t> g_shader_compile_microseconds {0};
