@@ -720,16 +720,23 @@ if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND (CMAKE_OSX_ARCHITECTURES S
 	endif()
 endif()
 
-# Magnus iOS: build static lib for Stinger front-end (Bridge.cpp lives outside
-# this repo at ../../Source/Stinger/Bridge.cpp). Desktop keeps Kyty executable.
+# Magnus iOS: build static lib for Stinger front-end. The production UI bridge
+# lives outside this repo at ../../Source/Stinger/Bridge.cpp; when absent,
+# fall back to the in-repo stub (ios/Stinger/Bridge.cpp) so the core links
+# and the unsigned IPA builds. The stub refuses game boot with a clear
+# message until the real FEX-backed Stinger lands.
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
 	set(MAGNUS_STINGER_BRIDGE "${CMAKE_CURRENT_SOURCE_DIR}/../../Source/Stinger/Bridge.cpp"
 		CACHE FILEPATH "Stinger iOS UI bridge")
+	set(MAGNUS_STINGER_BRIDGE_FALLBACK "${CMAKE_CURRENT_SOURCE_DIR}/ios/Stinger/Bridge.cpp")
 	add_library(kyty_emulator STATIC ${kyty_emulator_src})
 	if(EXISTS "${MAGNUS_STINGER_BRIDGE}")
 		target_sources(kyty_emulator PRIVATE "${MAGNUS_STINGER_BRIDGE}")
+	elseif(EXISTS "${MAGNUS_STINGER_BRIDGE_FALLBACK}")
+		target_sources(kyty_emulator PRIVATE "${MAGNUS_STINGER_BRIDGE_FALLBACK}")
+		message(STATUS "Magnus: using in-repo Stinger stub ${MAGNUS_STINGER_BRIDGE_FALLBACK}")
 	else()
-		message(WARNING "Magnus: Stinger Bridge.cpp not found at ${MAGNUS_STINGER_BRIDGE}; iOS static lib builds without UI bridge")
+		message(WARNING "Magnus: no Stinger Bridge found; iOS static lib builds without UI bridge")
 	endif()
 
 	# FEX-Emu provides x86-64 -> ARM64 JIT for A19 Pro. Must be prebuilt for iphoneos.
@@ -748,12 +755,23 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
 		"${FEX_ROOT}/External/fmt/include"
 		"${FEX_ROOT}/External/unordered_dense/include"
 		"${FEX_ROOT}/External/vixl/src")
-	target_link_libraries(kyty_emulator
+	# FEX iphoneos static libs are built separately (see workflow). Link only
+	# the ones present so configure+core build proceed with the stub runtime;
+	# the unsigned IPA links whatever exists. Missing libs => game boot
+	# refuses with a clear message (see ios/Stinger/Bridge.cpp).
+	set(MAGNUS_FEX_LIBS
 		"${FEX_BUILD}/FEXCore/Source/libFEXCore.a"
 		"${FEX_BUILD}/FEXCore/Source/libFEXCore_Base.a"
 		"${FEX_BUILD}/External/cephes/libcephes_128bit.a"
 		"${FEX_BUILD}/External/SoftFloat-3e/libsoftfloat_3e.a"
 		"${FEX_BUILD}/External/tiny-json/libtiny-json.a")
+	foreach(fex_lib IN LISTS MAGNUS_FEX_LIBS)
+		if(EXISTS "${fex_lib}")
+			target_link_libraries(kyty_emulator "${fex_lib}")
+		else()
+			message(STATUS "Magnus: FEX lib not yet built, skipping: ${fex_lib}")
+		endif()
+	endforeach()
 	message(STATUS "Magnus FEX source ${FEX_ROOT}, build ${FEX_BUILD}")
 
 	target_compile_definitions(kyty_emulator PRIVATE __IPHONEOS__=1)

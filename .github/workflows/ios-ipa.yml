@@ -95,6 +95,18 @@ jobs:
       - name: Build kyty_emulator static lib
         run: cmake --build build-ios --target kyty_emulator --parallel $(sysctl -n hw.ncpu)
 
+      - name: Build unsigned IPA (no paid signing; user re-signs)
+        run: |
+          chmod +x ios/Stinger/build-unsigned-ipa.sh
+          bash ios/Stinger/build-unsigned-ipa.sh build-unsigned
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: magnus-unsigned-ipa
+          path: build-unsigned/MagnusPS5-unsigned.ipa
+          if-no-files-found: error
+
       - name: Validate SideStore packaging prereqs
         run: |
           ls build-ios/*.a || find build-ios -name "*.a" | head
