@@ -72,7 +72,9 @@ jobs:
             -DCMAKE_OSX_DEPLOYMENT_TARGET=17.4 \
             -DCMAKE_BUILD_TYPE=Release \
             -DTUNE_CPU=none \
-            -DBUILD_TESTING=OFF
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_C_FLAGS="-DFEX_IOS_HOST" \
+            -DCMAKE_CXX_FLAGS="-DFEX_IOS_HOST"
           cmake --build build-iphoneos --parallel $(sysctl -n hw.ncpu)
           find build-iphoneos -name 'libFEXCore*.a' -o -name 'libcephes_128bit.a' -o -name 'libsoftfloat_3e.a' -o -name 'libtiny-json.a' | head -n 20
 
