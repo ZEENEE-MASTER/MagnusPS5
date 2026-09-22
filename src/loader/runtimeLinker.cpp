@@ -18,6 +18,7 @@
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/jit.h"
+#include "ios/fex_guest.h"
 #include "loader/redZonePatcher.h"
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
@@ -490,8 +491,17 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	               "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
 #endif
 #else
+#if defined(__APPLE__)
+	// iOS ARM64 cannot execute guest x86-64 bytes natively: dispatch through
+	// the FEX JIT (ios/Stinger/Bridge.cpp). macOS builds are x86_64 and take
+	// the native path above; this branch is iPhone-only in practice.
+	Magnus::RunGuestEntry(addr, reinterpret_cast<uint64_t>(params),
+	                       reinterpret_cast<uint64_t>(atexit_func),
+	                       stack_top != nullptr ? reinterpret_cast<uint64_t>(stack_top) : 0);
+#else
 	(void)stack_top;
 	reinterpret_cast<entry_func_t>(addr)(params, atexit_func);
+#endif
 #endif
 }
 
@@ -782,10 +792,15 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
+#if defined(__x86_64__) || defined(_M_X64)
+	// x86-64 hosts execute guest code natively and may need SSE4a emulation.
+	// On iOS ARM64 all guest code runs inside FEX threads; FEX owns fault
+	// recovery there, so this must not reference the excluded emulator.
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
 		return true;
 	}
+#endif
 
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
 		using CoreAccess = Common::HostException::AccessViolationType;
@@ -2162,7 +2177,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			     result.unrelocatable_memory_instruction_count);
 			reciprocal_sqrt_count = result.reciprocal_sqrt_instruction_count;
 		}
-#else
+#elif defined(__x86_64__) || defined(_M_X64)
 		if (emulate_rsqrt) {
 			reciprocal_sqrt_count =
 			    X64InstructionEmulator::PatchReciprocalSquareRoots(segment_addr, segment_size);

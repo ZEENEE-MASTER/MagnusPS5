@@ -773,7 +773,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
 	target_sources(kyty_emulator PRIVATE
 		"${KYTY_SOURCE_DIR}/ios/cache.cpp"
 		"${KYTY_SOURCE_DIR}/ios/embed.cpp"
-		"${KYTY_SOURCE_DIR}/ios/controller_shim.cpp")
+		"${KYTY_SOURCE_DIR}/ios/controller_shim.cpp"
+		"${CMAKE_CURRENT_SOURCE_DIR}/ios/Stinger/jit_pool.cpp")
 	# iPhone 17 Pro Max tuning defaults (A19 Pro 6-core, 12GB, iOS 26):
 	# - Prefer MetalFX spatial upscaling + 60Hz vblank (120Hz ProMotion costs thermals)
 	# - Persistent shader/pipeline cache under app container (see src/ios/embed.cpp)
