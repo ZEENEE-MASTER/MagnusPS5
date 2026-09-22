@@ -40,11 +40,6 @@ if (NOT (WIN32 OR LINUX OR APPLE OR CMAKE_SYSTEM_NAME STREQUAL "iOS"))
     message(FATAL_ERROR "only Windows, Linux, macOS, and iOS builds are supported")
 endif()
 
-# Magnus iOS: iOS rides the POSIX/Linux code paths like macOS does.
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-	set(LINUX TRUE)
-endif()
-
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -841,7 +836,8 @@ elseif(WIN32 OR LINUX)
 	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS} -Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")
 endif()
 
-if(LINUX)
+if(LINUX AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # GNU-ld only (--strip-all is not Apple ld64 syntax).
     target_link_options(kyty_emulator PRIVATE
         $<$<CONFIG:Release>:-Wl,--strip-all>
     )
