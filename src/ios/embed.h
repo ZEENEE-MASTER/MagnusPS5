@@ -59,6 +59,10 @@ struct MagnusStats {
 
 void magnus_stats(struct MagnusStats* out);
 
+// Device trace channel: appends FEX/boot diagnostics to a file in the app
+// container (Stinger passes Documents/magnus-boot.log, visible via Files).
+void magnus_set_log_file(const char* path);
+
 void magnus_set_shader_cache_dir(const char* path);
 
 void magnus_set_network_enabled(bool enabled);

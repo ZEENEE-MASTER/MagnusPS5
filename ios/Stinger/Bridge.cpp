@@ -47,13 +47,33 @@
 namespace {
 
 // --- Diagnostics -----------------------------------------------------------
+// Device trace channel: mirrors every line to Documents/magnus-boot.log
+// (set via magnus_set_log_file) so traces survive without a console.
+
+std::mutex g_log_mutex;
+FILE* g_log_file = nullptr;
+
+void FexLogToFile(const char* line) {
+	std::lock_guard<std::mutex> lock(g_log_mutex);
+	if (g_log_file != nullptr) {
+		std::fputs(line, g_log_file);
+		std::fputc('\n', g_log_file);
+		std::fflush(g_log_file);
+	}
+}
 
 void FexLog(LogMan::DebugLevels level, const char* msg) {
-	LOGF("[FEX:%s] %s\n", LogMan::DebugLevelStr(level), msg);
+	char line[1152];
+	std::snprintf(line, sizeof(line), "[FEX:%s] %s", LogMan::DebugLevelStr(level), msg);
+	LOGF("%s\n", line);
+	FexLogToFile(line);
 }
 
 void FexThrow(const char* msg) {
-	LOGF("[FEX:THROW] %s\n", msg);
+	char line[1152];
+	std::snprintf(line, sizeof(line), "[FEX:THROW] %s", msg);
+	LOGF("%s\n", line);
+	FexLogToFile(line);
 }
 
 std::atomic<uint64_t> g_compiled_blocks {0};
@@ -305,6 +325,17 @@ void SetupGDT(FEXCore::Core::InternalThreadState* thread) {
 
 namespace Magnus {
 
+void SetLogFile(const char* path) {
+	std::lock_guard<std::mutex> lock(g_log_mutex);
+	if (g_log_file != nullptr) {
+		std::fclose(g_log_file);
+		g_log_file = nullptr;
+	}
+	if (path != nullptr && path[0] != '\0') {
+		g_log_file = std::fopen(path, "a");
+	}
+}
+
 bool ReserveStingerRuntime() {
 	return FexInitOnce(g_failure);
 }
@@ -404,4 +435,8 @@ extern "C" uint64_t FEXFrontendCompileMicroseconds() {
 
 extern "C" uint64_t FEXBackendCompileMicroseconds() {
 	return g_backend_us.load(std::memory_order_relaxed);
+}
+
+extern "C" void magnus_set_log_file(const char* path) {
+	Magnus::SetLogFile(path);
 }

@@ -58,6 +58,8 @@ jobs:
           git -C FEX fetch --depth 1 origin ${{ env.FEX_REF }}
           git -C FEX checkout -q FETCH_HEAD
           git -C FEX submodule update --init --recursive
+          git -C FEX apply --check "$GITHUB_WORKSPACE/patches/fex-ios-staticlib.patch"
+          git -C FEX apply "$GITHUB_WORKSPACE/patches/fex-ios-staticlib.patch"
           ls FEX/External/vixl/src
 
       - name: Build FEX for iphoneos (provides libFEXCore.a etc.)
@@ -72,9 +74,7 @@ jobs:
             -DCMAKE_OSX_DEPLOYMENT_TARGET=17.4 \
             -DCMAKE_BUILD_TYPE=Release \
             -DTUNE_CPU=none \
-            -DBUILD_TESTING=OFF \
-            -DCMAKE_C_FLAGS="-DFEX_IOS_HOST" \
-            -DCMAKE_CXX_FLAGS="-DFEX_IOS_HOST"
+            -DBUILD_TESTING=OFF
           cmake --build build-iphoneos --parallel $(sysctl -n hw.ncpu)
           find build-iphoneos -name 'libFEXCore*.a' -o -name 'libcephes_128bit.a' -o -name 'libsoftfloat_3e.a' -o -name 'libtiny-json.a' | head -n 20
 

@@ -255,6 +255,14 @@ static BOOL MagnusFolderHasEboot(NSString* folder) {
     didFinishLaunchingWithOptions:(NSDictionary*)launchOptions {
 	(void)application;
 	(void)launchOptions;
+	// Device trace channel first: everything FEX/boot logs from here on is
+	// mirrored to Documents/magnus-boot.log (Files app, for the trace loop).
+	NSArray* docs =
+      [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory
+                                                   inDomains:NSUserDomainMask];
+	NSString* logPath =
+      [[docs.firstObject path] stringByAppendingPathComponent:@"magnus-boot.log"];
+	magnus_set_log_file([logPath UTF8String]);
 	self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
 	MagnusLibraryViewController* library = [[MagnusLibraryViewController alloc] init];
 	UINavigationController* nav =
