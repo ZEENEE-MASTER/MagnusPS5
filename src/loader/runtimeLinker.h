@@ -160,10 +160,9 @@ public:
 	void RelocateProgram(Program* program);
 
 	void  Execute(const std::filesystem::path& game_patch = {});
-	int   StartModule(Program* program, size_t args, const void* argp, module_func_t func,
-	                  uint64_t stack_top = 0);
+	int   StartModule(Program* program, size_t args, const void* argp, module_func_t func);
 	int   StopModule(Program* program, size_t args, const void* argp, module_func_t func);
-	void  StartAllModules(uint64_t stack_top);
+	void  StartAllModules();
 	void  StopAllModules();
 	void  DeleteTlss(int thread_id);
 	void  SetApplicationHeapApi(void* const api[10]);
@@ -209,24 +208,6 @@ private:
 	application_heap_free_func_t           m_application_heap_free           = nullptr;
 	application_heap_posix_memalign_func_t m_application_heap_posix_memalign = nullptr;
 };
-
-// The calling thread's guest TCB, i.e. what fs points at on hardware. On an x86-64 host the guest
-// reads it through the patched TLS stubs and the host's own fs covers the rest; a CPU layer has to
-// be told, or every unpatched fs-relative access lands at a small absolute address.
-[[nodiscard]] uint64_t GuestTlsBase();
-
-// An address the guest may call. A host address goes through the CPU layer's thunk; a guest
-// address, and every address on an x86-64 host, comes back unchanged.
-[[nodiscard]] uint64_t GuestCallable(uint64_t addr);
-
-// Run a guest function pointer an HLE library was handed. True when the CPU layer ran it and
-// *result holds the guest's rax; false means the address is host code (or there is no CPU layer)
-// and the caller should call it directly, as it does on an x86-64 host.
-bool CallGuestVia(uint64_t fn, const uint64_t* args, uint32_t arg_count, uint64_t* result);
-bool CallGuestViaOnStack(uint64_t fn, const uint64_t* args, uint32_t arg_count, uint64_t stack_top,
-                         uint64_t* result);
-bool DescribeGuestAddress(uint64_t vaddr, const char** module_name, uint64_t* offset);
-bool GuestImageRange(uint64_t* begin, uint64_t* end);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestMainEntryUsesGuestStack();

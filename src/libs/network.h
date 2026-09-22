@@ -40,6 +40,7 @@ int KYTY_SYSV_ABI NetTerm();
 int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags);
 int KYTY_SYSV_ABI NetPoolDestroy(int memid);
 int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags);
+int KYTY_SYSV_ABI NetResolverDestroy(int rid);
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags);
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst);
@@ -105,6 +106,8 @@ int KYTY_SYSV_ABI HttpCreateConnectionWithURL(int tmpl_id, const char* url, int 
 int KYTY_SYSV_ABI HttpDeleteConnection(int conn_id);
 int KYTY_SYSV_ABI HttpCreateRequest(int conn_id, int method, const char* path,
                                     uint64_t content_length);
+int KYTY_SYSV_ABI HttpCreateRequest2(int conn_id, const char* method, const char* path,
+                                     uint64_t content_length);
 int KYTY_SYSV_ABI HttpCreateRequestWithURL2(int conn_id, const char* method, const char* url,
                                             uint64_t content_length);
 int KYTY_SYSV_ABI HttpSetRequestContentLength(int request_id, uint64_t content_length);
@@ -150,6 +153,8 @@ int KYTY_SYSV_ABI  NetCtlRegisterCallback(NetCtlCallback func, void* arg, int* c
 int KYTY_SYSV_ABI  NetCtlUnregisterCallback(int cid);
 int KYTY_SYSV_ABI  NetCtlGetResult(int event_type, int* error_code);
 int KYTY_SYSV_ABI  NetCtlGetInfo(int code, NetCtlInfo* info);
+// Magnus iOS: kill-switch for game network (default OFF for perf/battery).
+// TODO: wire to NetCtl state in src/ios/controller_shim.cpp.
 void               SetNetworkEnabled(bool enabled);
 
 } // namespace NetCtl
@@ -165,11 +170,14 @@ struct NpCreateAsyncRequestParameter;
 struct NpCheckPremiumParameter;
 struct NpCheckPremiumResult;
 
+using NpStateCallbackA = KYTY_SYSV_ABI void (*)(int user_id, uint32_t state, void* userdata);
+
 int KYTY_SYSV_ABI  NpCheckCallback();
 int KYTY_SYSV_ABI  NpSetNpTitleId(const NpTitleId* title_id, const NpTitleSecret* title_secret);
 int KYTY_SYSV_ABI  NpSetContentRestriction(const NpContentRestriction* restriction);
 int KYTY_SYSV_ABI  NpRegisterStateCallback(void* callback, void* userdata);
 int KYTY_SYSV_ABI  NpUnregisterStateCallback();
+int KYTY_SYSV_ABI  NpRegisterStateCallbackA(NpStateCallbackA callback, void* userdata);
 void KYTY_SYSV_ABI NpRegisterGamePresenceCallback(void* callback, void* userdata);
 int KYTY_SYSV_ABI  NpRegisterPlusEventCallback(void* callback, void* userdata);
 int KYTY_SYSV_ABI  NpRegisterPremiumEventCallback(void* callback, void* userdata);

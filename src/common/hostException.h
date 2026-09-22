@@ -31,8 +31,6 @@ struct ExceptionInfo {
 	uint64_t            r14                    = 0;
 	uint64_t            r15                    = 0;
 	uint32_t            native_code            = 0;
-	// True when the x86-64 register fields above hold the guest's registers.
-	bool guest_registers_valid = false;
 	// Platform-specific mutable context, valid only for the duration of the handler call.
 	void* native_context = nullptr;
 };
@@ -41,12 +39,9 @@ using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
 
-// Where the host does not run guest instructions directly, the fault context holds host
-// registers and the guest's x86-64 register file belongs to the CPU layer, which installs
-// a reader here to fill the fields above.
-using GuestRegisterReader = bool (*)(void* native_context, ExceptionInfo& info);
-
-void SetGuestRegisterReader(GuestRegisterReader reader);
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+bool InitializeThreadSignalStack();
+#endif
 
 } // namespace Common::HostException
 

@@ -12,14 +12,6 @@ class Presenter;
 void                     WindowRun();
 void                     WindowShutdown();
 
-void          SetExternalSurface(void* metal_layer, uint32_t width, uint32_t height);
-[[nodiscard]] void* ExternalSurface();
-void          ExternalSurfaceSize(uint32_t* width, uint32_t* height);
-void          SetAppPaused(bool paused);
-[[nodiscard]] bool IsAppPaused();
-
-[[nodiscard]] uint64_t GuestFrameCount();
-
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_WINDOW_H_ */

@@ -1,11 +1,10 @@
-#if defined(__APPLE__) && defined(__aarch64__)
-static constexpr uint64_t HOST_SYSTEM_MANAGED_MIN = 0x0100000000ull;
-#else
-static constexpr uint64_t HOST_SYSTEM_MANAGED_MIN = 0x0000040000ull;
-#endif
+// Internal memory address-space helpers included by memory.cpp.
+// Kept in the same translation unit because they depend on memory.cpp-local helpers.
+
+static constexpr uint64_t HOST_SYSTEM_MANAGED_MIN  = 0x0000040000ull;
 static constexpr uint64_t HOST_SYSTEM_MANAGED_MAX  = 0x07ffffbfffull;
 static constexpr uint64_t HOST_SYSTEM_RESERVED_MIN = HOST_SYSTEM_MANAGED_MAX + 1u;
-#if defined(__APPLE__)
+#if defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64))
 static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fbfffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x7000000000ull;
 #else
@@ -13,36 +12,6 @@ static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fffffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
 #endif
 static constexpr uint64_t HOST_USER_MAX = 0xfbffffffffull;
-
-#if defined(__IPHONEOS__)
-extern "C" bool FEXRunningOnIOSDevice();
-
-static bool GuestBudgetIsDevice() {
-	static const bool device = FEXRunningOnIOSDevice();
-	return device;
-}
-
-static uint64_t HostUserReserveEnd() {
-	return GuestBudgetIsDevice() ? HOST_USER_MIN : HOST_USER_MAX + 1u;
-}
-
-static uint64_t HostSystemReservedGuestEnd() {
-	return GuestBudgetIsDevice() ? HOST_SYSTEM_RESERVED_MIN + 0x200000000ull
-	                             : HOST_SYSTEM_RESERVED_MAX + 1u;
-}
-#else
-static uint64_t HostUserReserveEnd() {
-	return HOST_USER_MAX + 1u;
-}
-
-static uint64_t HostSystemReservedGuestEnd() {
-	return HOST_SYSTEM_RESERVED_MAX + 1u;
-}
-#endif
-#if defined(__APPLE__) && defined(__aarch64__)
-static constexpr uint64_t HOST_RUNTIME_MIN = 0x160000000ull;
-static constexpr uint64_t HOST_RUNTIME_MAX = 0x200000000ull;
-#endif
 
 static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t candidate,
                                    uint64_t size) {
@@ -75,9 +44,9 @@ public:
 
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		m_handle = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE,
-		                              static_cast<DWORD>(m_size >> 32u),
-		                              static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
+		m_handle = CreateFileMappingA(
+		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
 		if (m_handle == nullptr) {
 			LOGF_COLOR(Log::Color::Red,
 			           "\t direct-memory backing: CreateFileMapping failed: 0x%08" PRIx32 "\n",
@@ -97,57 +66,35 @@ public:
 #if defined(__APPLE__)
 		{
 			char shm_name[64];
-			snprintf(shm_name, sizeof(shm_name), "/magnus-dm-%d-%llx", static_cast<int>(getpid()),
+			snprintf(shm_name, sizeof(shm_name), "/kyty-dm-%d-%llx", static_cast<int>(getpid()),
 			         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(this)));
-				m_fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
-				if (m_fd >= 0) {
-					shm_unlink(shm_name);
-				} else if (const char* temp = std::getenv("TMPDIR")) {
-					char temp_name[1024];
-					const int length = std::snprintf(temp_name, sizeof(temp_name), "%s/magnus-dm-XXXXXX", temp);
-					if (length > 0 && static_cast<size_t>(length) < sizeof(temp_name)) {
-						m_fd = mkstemp(temp_name);
-						if (m_fd >= 0) {
-							unlink(temp_name);
-						}
-					}
-				}
+			m_fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+			if (m_fd >= 0) {
+				shm_unlink(shm_name);
 			}
+		}
 #else
-		m_fd = static_cast<int>(syscall(SYS_memfd_create, "DirectMemory", 0));
+		m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", 0));
 #endif
-			if (m_fd < 0) {
-				m_failure_stage = "open";
-				m_failure_errno = errno;
-				LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: shared fd creation failed: %d\n",
-				           errno);
-				return;
-			}
-			if (ftruncate(m_fd, static_cast<off_t>(m_size)) != 0) {
-				m_failure_stage = "truncate";
-				m_failure_errno = errno;
-				LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: ftruncate failed: %d\n", errno);
+		if (m_fd < 0) {
+			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: shared fd creation failed: %d\n",
+			           errno);
+			return;
+		}
+		if (ftruncate(m_fd, static_cast<off_t>(m_size)) != 0) {
+			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: ftruncate failed: %d\n", errno);
 			close(m_fd);
 			m_fd = -1;
 			return;
 		}
-			auto* backing = mmap(nullptr, m_size, PROT_READ | PROT_WRITE, MAP_SHARED, m_fd, 0);
-			if (backing == MAP_FAILED) {
-			#if defined(__APPLE__)
-				m_sparse_io = true;
-				m_failure_stage = "none";
-				m_failure_errno = 0;
-				return;
-			#else
-				m_failure_stage = "map";
-				m_failure_errno = errno;
-				LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: writable alias failed: %d\n",
-				           errno);
-				close(m_fd);
-				m_fd = -1;
-				return;
-			#endif
-			}
+		auto* backing = mmap(nullptr, m_size, PROT_READ | PROT_WRITE, MAP_SHARED, m_fd, 0);
+		if (backing == MAP_FAILED) {
+			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: writable alias failed: %d\n",
+			           errno);
+			close(m_fd);
+			m_fd = -1;
+			return;
+		}
 		m_backing_base = static_cast<uint8_t*>(backing);
 #endif
 	}
@@ -198,8 +145,8 @@ public:
 	[[nodiscard]] bool IsAvailable() const {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return m_handle != nullptr && m_backing_base != nullptr;
-	#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-		return m_fd >= 0 && (m_backing_base != nullptr || m_sparse_io);
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+		return m_fd >= 0 && m_backing_base != nullptr;
 #else
 		return false;
 #endif
@@ -210,27 +157,13 @@ public:
 	}
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
-	[[nodiscard]] const char* GetFailureStage() const { return m_failure_stage; }
-	[[nodiscard]] int GetFailureErrno() const { return m_failure_errno; }
 
 	bool ZeroRange(uint64_t backing_offset, uint64_t size) {
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
-		if (m_backing_base != nullptr) {
-			std::memset(m_backing_base + backing_offset, 0, size);
-			return true;
-		}
-#if defined(__APPLE__)
-		fpunchhole_t hole {0, 0, static_cast<off_t>(backing_offset), static_cast<off_t>(size)};
-		if (fcntl(m_fd, F_PUNCHHOLE, &hole) == 0) {
-			return true;
-		}
-#endif
-		return TransferFileRange(backing_offset, 0, size,
-		                         [](uint8_t* backing, uint64_t, size_t bytes) {
-			                         std::memset(backing, 0, bytes);
-		                         });
+		std::memset(m_backing_base + backing_offset, 0, size);
+		return true;
 	}
 
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
@@ -287,15 +220,7 @@ public:
 			const auto  start  = std::max(vaddr, entry.vaddr);
 			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - start;
 			const auto  offset = entry.backing_offset + start - entry.vaddr;
-			if (m_backing_base != nullptr) {
-				std::memcpy(destination + start - vaddr, m_backing_base + offset, bytes);
-			} else if (!TransferFileRange(
-			               offset, start - vaddr, bytes,
-			               [destination](uint8_t* backing, uint64_t data_offset, size_t count) {
-				               std::memcpy(destination + data_offset, backing, count);
-			               })) {
-				return false;
-			}
+			std::memcpy(destination + start - vaddr, m_backing_base + offset, bytes);
 		}
 		return true;
 	}
@@ -384,6 +309,9 @@ public:
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// Each unmapped file view becomes a separate Windows placeholder. The address-space owner
+		// records this contiguous guest span as one free range, so normalize fragmented backing
+		// views into one placeholder before publishing it there.
 		if (removed.size() > 1 && !CoalescePlaceholders(vaddr, size)) {
 			for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
 				EXIT_IF(!MapExistingPlaceholderFixed(it->vaddr, it->size, it->backing_offset,
@@ -429,6 +357,11 @@ public:
 			return false;
 		}
 
+		const uint64_t left_size  = vaddr - old.vaddr;
+		const uint64_t right_addr = vaddr + size;
+		const uint64_t old_end    = old.vaddr + old.size;
+		const uint64_t right_size = old_end - right_addr;
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		const bool exact_unmap = (vaddr == old.vaddr && size == old.size);
 		if (exact_unmap) {
@@ -444,14 +377,7 @@ public:
 			}
 			return true;
 		}
-#endif
 
-		const uint64_t left_size  = vaddr - old.vaddr;
-		const uint64_t right_addr = vaddr + size;
-		const uint64_t old_end    = old.vaddr + old.size;
-		const uint64_t right_size = old_end - right_addr;
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			bool ok = true;
 			if (left_size != 0 && left_size != old.size) {
@@ -494,37 +420,24 @@ public:
 		m_maps.emplace(old.vaddr, old);
 		return false;
 #else
-		{
-			std::lock_guard lock(m_mutex);
-			auto            entry = m_maps.find(old.vaddr);
-			EXIT_IF(entry == m_maps.end() || entry->second.size != old.size);
-			if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(vaddr), size)) {
-				const int error = errno;
-				std::fprintf(stderr,
-				             "Magnus:Memory:Error: backing unmap failed mapping=[0x%llx,0x%llx) "
-				             "remove=[0x%llx,0x%llx) errno=%d\n",
-				             static_cast<unsigned long long>(old.vaddr),
-				             static_cast<unsigned long long>(old_end),
-				             static_cast<unsigned long long>(vaddr),
-				             static_cast<unsigned long long>(right_addr), error);
-				return false;
-			}
-			m_maps.erase(entry);
-			if (left_size != 0) {
-				EXIT_IF(!m_maps
-				             .emplace(old.vaddr,
-				                      MapEntry {old.vaddr, left_size, old.backing_offset, old.mode})
-				             .second);
-			}
-			if (right_size != 0) {
-				EXIT_IF(!m_maps
-				             .emplace(right_addr,
-				                      MapEntry {right_addr, right_size,
-				                                old.backing_offset + (right_addr - old.vaddr),
-				                                old.mode})
-				             .second);
-			}
+		// Replace only the requested range so concurrent accesses and GPU watch
+		// protections on the surviving mappings remain intact.
+		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(vaddr), size)) {
+			return false;
 		}
+
+		std::lock_guard lock(m_mutex);
+		m_maps.erase(old.vaddr);
+		if (left_size != 0) {
+			m_maps.emplace(old.vaddr,
+			               MapEntry {old.vaddr, left_size, old.backing_offset, old.mode});
+		}
+		if (right_size != 0) {
+			m_maps.emplace(right_addr,
+			               MapEntry {right_addr, right_size,
+			                         old.backing_offset + right_addr - old.vaddr, old.mode});
+		}
+
 		if (placeholder_preserved != nullptr) {
 			*placeholder_preserved = true;
 		}
@@ -558,39 +471,6 @@ public:
 
 private:
 	template <typename Transfer>
-	bool TransferFileRange(uint64_t backing_offset, uint64_t data_offset, uint64_t size,
-	                       Transfer transfer) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-		constexpr uint64_t window_size = 64ull * 1024ull * 1024ull;
-		const uint64_t page_size = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
-		while (size != 0) {
-			const uint64_t aligned_offset = backing_offset & ~(page_size - 1u);
-			const uint64_t delta = backing_offset - aligned_offset;
-			const uint64_t bytes = std::min(size, window_size - delta);
-			const uint64_t mapped_size = (delta + bytes + page_size - 1u) & ~(page_size - 1u);
-			void* mapped = mmap(nullptr, mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED, m_fd,
-			                    static_cast<off_t>(aligned_offset));
-			if (mapped == MAP_FAILED) {
-				return false;
-			}
-			transfer(static_cast<uint8_t*>(mapped) + delta, data_offset,
-			         static_cast<size_t>(bytes));
-			munmap(mapped, mapped_size);
-			backing_offset += bytes;
-			data_offset += bytes;
-			size -= bytes;
-		}
-		return true;
-#else
-		(void)backing_offset;
-		(void)data_offset;
-		(void)size;
-		(void)transfer;
-		return false;
-#endif
-	}
-
-	template <typename Transfer>
 	bool TryTransferBacking(uint64_t vaddr, uint64_t size, Transfer transfer) {
 		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -617,11 +497,7 @@ private:
 			EXIT_IF(!FindContainingUnlocked(current, 1, &entry));
 			const auto bytes  = std::min(end, entry.vaddr + entry.size) - current;
 			const auto offset = entry.backing_offset + current - entry.vaddr;
-			if (m_backing_base != nullptr) {
-				transfer(m_backing_base + offset, current - vaddr, static_cast<size_t>(bytes));
-			} else if (!TransferFileRange(offset, current - vaddr, bytes, transfer)) {
-				return false;
-			}
+			transfer(m_backing_base + offset, current - vaddr, static_cast<size_t>(bytes));
 			current += bytes;
 		}
 		return true;
@@ -748,6 +624,8 @@ private:
 		return ptr;
 	}
 
+	// Replace the file view atomically instead of exposing an unmapped hole in the
+	// process-lifetime guest reservation.
 	static bool UnmapViewPreservePlaceholder(void* vaddr, uint64_t size) {
 		void* ptr = mmap(vaddr, size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
 		return ptr != MAP_FAILED && ptr == vaddr;
@@ -758,9 +636,6 @@ private:
 
 	uint8_t*                     m_backing_base = nullptr;
 	uint64_t                     m_size         = 0;
-	const char*                  m_failure_stage = "none";
-	int                          m_failure_errno = 0;
-	bool                         m_sparse_io     = false;
 	std::mutex                   m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
 };
@@ -776,8 +651,14 @@ public:
 		ReserveGuestRegions();
 		m_backing = new GuestBackingStore(backing_size);
 		if (!m_backing->IsAvailable()) {
-			EXIT("direct-memory backing unavailable: stage=%s errno=%d size=%" PRIu64 "\n",
-			     m_backing->GetFailureStage(), m_backing->GetFailureErrno(), backing_size);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			EXIT("could not reserve %" PRIu64 " MB for guest direct memory. Windows commits\n"
+			     "this up front, so the paging file is usually what needs to be larger.\n",
+			     backing_size / (1024U * 1024U));
+#else
+			EXIT("could not reserve %" PRIu64 " MB for guest direct memory\n",
+			     backing_size / (1024U * 1024U));
+#endif
 		}
 	}
 
@@ -961,9 +842,7 @@ public:
 	bool Commit(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		std::lock_guard lock(m_mutex);
 		if (!ConsumeUnlocked(vaddr, size)) {
-			if (!ClaimFixedUnlocked(vaddr, size) || !ConsumeUnlocked(vaddr, size)) {
-				return false;
-			}
+			return false;
 		}
 		const auto host_mode = VirtualMemory::IsExecute(mode)
 		                           ? VirtualMemory::Mode::ExecuteReadWrite
@@ -992,28 +871,6 @@ public:
 #endif
 	}
 
-	bool ClaimFixedUnlocked(uint64_t vaddr, uint64_t size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		(void)vaddr;
-		(void)size;
-		return false;
-#else
-		const auto start = AlignDown(vaddr, PageSize());
-		const auto end   = AlignUp(vaddr + size, PageSize());
-		void*      ptr   = mmap(reinterpret_cast<void*>(start), end - start, PROT_NONE,
-		                        MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0);
-		if (ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != start) {
-			if (ptr != MAP_FAILED) {
-				munmap(ptr, end - start);
-			}
-			return false;
-		}
-		AddFreeUnlocked(start, end - start);
-		m_owned.emplace_back(start, end - start);
-		return true;
-#endif
-	}
-
 	bool ReleaseCommitted(uint64_t vaddr, uint64_t size) {
 		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
 			return false;
@@ -1036,6 +893,7 @@ public:
 			EXIT_IF(VirtualFree(reinterpret_cast<void*>(region_vaddr), region_size,
 			                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0);
 		}
+		// ReleaseCommitted also publishes the aggregate span as one logical free range.
 		EXIT_IF(regions.size() > 1 && !CoalescePlaceholders(vaddr, size));
 #else
 		for (const auto& [region_vaddr, region_size]: regions) {
@@ -1060,7 +918,7 @@ public:
 		}
 
 		auto* ptr = reinterpret_cast<uint64_t*>(addr);
-		*ptr      = 0x4b59545950484f4cull;
+		*ptr      = 0x4b59545950484f4cull; // "KYTYPHOL"
 
 		if (!ReleaseCommitted(addr, PageSize())) {
 			LOGF_COLOR(Log::Color::Red,
@@ -1258,44 +1116,15 @@ private:
 			next_addr = region_end;
 		}
 #else
-		#if defined(__APPLE__) && defined(__aarch64__)
-		const std::array<std::pair<uint64_t, uint64_t>, 4> regions {{
-		    {HOST_SYSTEM_MANAGED_MIN, HOST_RUNTIME_MIN},
-		    {HOST_RUNTIME_MAX, HOST_SYSTEM_MANAGED_MAX + 1u},
-		    {HOST_SYSTEM_RESERVED_MIN, HostSystemReservedGuestEnd()},
-		    {HOST_USER_MIN, HostUserReserveEnd()},
-		}};
-		#else
 		const std::array<std::pair<uint64_t, uint64_t>, 3> regions {{
 		    {HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_MANAGED_MAX + 1u},
-		    {HOST_SYSTEM_RESERVED_MIN, HostSystemReservedGuestEnd()},
-		    {HOST_USER_MIN, HostUserReserveEnd()},
+		    {HOST_SYSTEM_RESERVED_MIN, HOST_SYSTEM_RESERVED_MAX + 1u},
+		    {HOST_USER_MIN, HOST_USER_MAX + 1u},
 		}};
-		#endif
 
-#if !defined(KYTY_LINKED_GUEST_ADDRESS_SPACE) && KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 		std::vector<std::pair<uint64_t, uint64_t>> occupied;
-#if defined(__APPLE__)
-		for (vm_address_t region_addr = 0;;) {
-			vm_size_t                      region_size = 0;
-			vm_region_basic_info_data_64_t info {};
-			mach_msg_type_number_t         info_count = VM_REGION_BASIC_INFO_COUNT_64;
-			mach_port_t                    object     = MACH_PORT_NULL;
-			if (vm_region_64(mach_task_self(), &region_addr, &region_size,
-			                   VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info),
-			                   &info_count, &object) != KERN_SUCCESS) {
-				break;
-			}
-			occupied.emplace_back(static_cast<uint64_t>(region_addr),
-			                      static_cast<uint64_t>(region_addr) +
-			                          static_cast<uint64_t>(region_size));
-			if (region_size == 0 || UINT64_MAX - region_addr < region_size) {
-				break;
-			}
-			region_addr += region_size;
-		}
-#else
-		FILE* maps = fopen("/proc/self/maps", "r");
+		FILE*                                      maps = fopen("/proc/self/maps", "r");
 		EXIT_IF(maps == nullptr);
 
 		char line[512];
@@ -1308,7 +1137,6 @@ private:
 			}
 		}
 		fclose(maps);
-#endif
 
 		auto reserve_range = [this](uint64_t start, uint64_t end) {
 			start = AlignUp(start, PageSize());
@@ -1319,27 +1147,18 @@ private:
 
 			const auto size = end - start;
 			int        flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
-#if defined(MAP_FIXED_NOREPLACE)
+#if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
+			flags |= MAP_FIXED;
+#elif defined(MAP_FIXED_NOREPLACE)
 			flags |= MAP_FIXED_NOREPLACE;
 #endif
 
 			void* ptr = mmap(reinterpret_cast<void*>(start), size, PROT_NONE, flags, -1, 0);
 			if (ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != start) {
-				if (std::getenv("MAGNUS_VERBOSE") != nullptr) {
-					printf("guest reserve FAILED [0x%016" PRIx64 ", 0x%016" PRIx64
-					       ") size=0x%" PRIx64 " %s\n",
-					       start, end, size,
-					       ptr == MAP_FAILED ? strerror(errno) : "landed elsewhere");
-				}
 				if (ptr != MAP_FAILED) {
 					munmap(ptr, size);
 				}
 				return;
-			}
-			if (std::getenv("MAGNUS_VERBOSE") != nullptr) {
-				printf("guest reserve ok     [0x%016" PRIx64 ", 0x%016" PRIx64
-				       ") size=0x%" PRIx64 "\n",
-				       start, end, size);
 			}
 
 			AddFreeUnlocked(start, size);
@@ -1509,6 +1328,8 @@ private:
 
 	void RestorePlaceholder(uint64_t vaddr, uint64_t size) {
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+		// The address remains owned for the process lifetime; MAP_FIXED only replaces one of our
+		// mappings and never acquires a new guest address.
 		void* ptr = mmap(reinterpret_cast<void*>(vaddr), size, PROT_NONE,
 		                 MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
 		EXIT_IF(ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != vaddr);

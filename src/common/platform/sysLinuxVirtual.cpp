@@ -1,10 +1,10 @@
 #include "common/common.h"
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_LINUX
+// #error "KYTY_PLATFORM != KYTY_PLATFORM_LINUX"
 #else
 
 #include "common/assert.h"
-#include "common/platform/sysVirtual.h"
 #include "common/virtualMemory.h"
 
 #include <atomic>
@@ -15,6 +15,7 @@
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #endif
 
 // IWYU pragma: no_include <asm/mman-common.h>
@@ -26,45 +27,12 @@
 #define KYTY_FIXED_NOREPLACE
 #endif
 
-namespace Common {
+namespace Common::VirtualMemory {
 
 static pthread_mutex_t              g_virtual_mutex {};
-static std::map<uintptr_t, size_t>* g_allocs   = nullptr;
-static std::map<uintptr_t, int>*    g_protects = nullptr;
+static std::map<uintptr_t, size_t>* g_allocs = nullptr;
 
-static int protection_at(uintptr_t address) {
-	auto next = g_protects->upper_bound(address);
-	return next == g_protects->begin() ? PROT_NONE : std::prev(next)->second;
-}
-
-static void record_protect(uintptr_t address, size_t size, int protect) {
-	if (size == 0 || address > UINTPTR_MAX - size) {
-		return;
-	}
-	const auto end = address + size;
-	const int after = protection_at(end);
-	g_protects->erase(g_protects->lower_bound(address), g_protects->lower_bound(end));
-	(*g_protects)[address] = protect;
-	if (after == protect) {
-		g_protects->erase(end);
-	} else {
-		(*g_protects)[end] = after;
-	}
-	auto current = g_protects->find(address);
-	if (current != g_protects->end()) {
-		if ((current == g_protects->begin() && current->second == PROT_NONE) ||
-		    (current != g_protects->begin() && std::prev(current)->second == current->second)) {
-			g_protects->erase(current);
-		}
-	}
-	current = g_protects->find(end);
-	if (current != g_protects->end() && current != g_protects->begin() &&
-	    std::prev(current)->second == current->second) {
-		g_protects->erase(current);
-	}
-}
-
-void SysVirtualInit() {
+void Init() {
 	pthread_mutexattr_t attr {};
 
 	pthread_mutexattr_init(&attr);
@@ -76,56 +44,28 @@ void SysVirtualInit() {
 	pthread_mutex_init(&g_virtual_mutex, &attr);
 	pthread_mutexattr_destroy(&attr);
 
-	g_allocs   = new std::map<uintptr_t, size_t>;
-	g_protects = new std::map<uintptr_t, int>;
+	g_allocs = new std::map<uintptr_t, size_t>;
 }
 
-static constexpr bool kHostRunsGuestCode =
-#if defined(__APPLE__) && defined(__aarch64__)
-    false;
-#else
-    true;
-#endif
-
-static int get_protection_flag(VirtualMemory::Mode mode) {
+static int get_protection_flag(Mode mode) {
 	int protect = PROT_NONE;
 	switch (mode) {
-		case VirtualMemory::Mode::Read: protect = PROT_READ; break;
-		case VirtualMemory::Mode::Write:
-		case VirtualMemory::Mode::ReadWrite: protect = PROT_READ | PROT_WRITE; break; // NOLINT
-		case VirtualMemory::Mode::Execute: protect = PROT_EXEC; break;
-		case VirtualMemory::Mode::ExecuteRead: protect = PROT_EXEC | PROT_READ; break; // NOLINT
-		case VirtualMemory::Mode::ExecuteWrite:
-		case VirtualMemory::Mode::ExecuteReadWrite:
+		case Mode::Read: protect = PROT_READ; break;
+		case Mode::Write:
+		case Mode::ReadWrite: protect = PROT_READ | PROT_WRITE; break; // NOLINT
+		case Mode::Execute: protect = PROT_EXEC; break;
+		case Mode::ExecuteRead: protect = PROT_EXEC | PROT_READ; break; // NOLINT
+		case Mode::ExecuteWrite:
+		case Mode::ExecuteReadWrite:
 			protect = PROT_EXEC | PROT_WRITE | PROT_READ;
 			break; // NOLINT
-		case VirtualMemory::Mode::NoAccess:
+		case Mode::NoAccess:
 		default: protect = PROT_NONE; break;
-	}
-	if constexpr (!kHostRunsGuestCode) {
-		if ((protect & PROT_EXEC) != 0) {
-			protect &= ~PROT_EXEC;
-			protect |= PROT_READ;
-		}
 	}
 	return protect;
 }
 
-static VirtualMemory::Mode get_protection_flag(int mode) {
-	switch (mode) {
-		case PROT_NONE: return VirtualMemory::Mode::NoAccess;
-		case PROT_READ: return VirtualMemory::Mode::Read;
-		case PROT_WRITE: return VirtualMemory::Mode::Write;
-		case PROT_READ | PROT_WRITE: return VirtualMemory::Mode::ReadWrite; // NOLINT
-		case PROT_EXEC: return VirtualMemory::Mode::Execute;
-		case PROT_EXEC | PROT_WRITE: return VirtualMemory::Mode::ExecuteWrite; // NOLINT
-		case PROT_EXEC | PROT_READ: return VirtualMemory::Mode::ExecuteRead;   // NOLINT
-		case PROT_EXEC | PROT_WRITE | PROT_READ:
-			return VirtualMemory::Mode::ExecuteReadWrite; // NOLINT
-		default: return VirtualMemory::Mode::NoAccess;
-	}
-}
-
+// Keep automatic mappings inside the guest and GPU-addressable low window.
 #ifdef KYTY_FIXED_NOREPLACE
 static constexpr uintptr_t LOW_ARENA_LIMIT = 0x000000FC00000000ULL; // libc mspace window ceiling
 static constexpr uintptr_t LOW_ARENA_FLOOR = 0x000000A000000000ULL; // 640 GiB
@@ -138,6 +78,7 @@ static_assert(LOW_ARENA_FLOOR < LOW_ARENA_LIMIT, "arena floor must sit below its
 static std::atomic<uintptr_t> g_low_arena_next {LOW_ARENA_LIMIT};
 #endif
 
+// Caller holds g_virtual_mutex.
 static void record_alloc(uintptr_t addr, size_t size) {
 	auto next = g_allocs->upper_bound(addr);
 	if (next != g_allocs->begin()) {
@@ -163,6 +104,7 @@ static uintptr_t align_up_to(uintptr_t addr, uint64_t alignment) {
 }
 #endif
 
+// Freed arena addresses are not reused while GPU caches remain keyed by address.
 static void* map_anonymous(uintptr_t addr, size_t size, int protect, int flags) {
 	if (addr != 0) {
 		return mmap(reinterpret_cast<void*>(addr), size, protect, flags, -1, 0); // NOLINT
@@ -187,7 +129,7 @@ static void* map_anonymous(uintptr_t addr, size_t size, int protect, int flags) 
 	return mmap(nullptr, size, protect, flags, -1, 0); // NOLINT
 }
 
-uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
+uint64_t Alloc(uint64_t address, uint64_t size, Mode mode) {
 	EXIT_IF(g_allocs == nullptr);
 
 	auto addr = static_cast<uintptr_t>(address);
@@ -201,7 +143,6 @@ uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mo
 	if (ptr != MAP_FAILED) {
 		pthread_mutex_lock(&g_virtual_mutex);
 		record_alloc(ret_addr, size);
-		record_protect(ret_addr, size, protect);
 		pthread_mutex_unlock(&g_virtual_mutex);
 	}
 
@@ -212,8 +153,7 @@ static uintptr_t align_up(uintptr_t addr, uint64_t alignment) {
 	return (addr + alignment - 1) & ~(alignment - 1);
 }
 
-uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::Mode mode,
-                                uint64_t alignment) {
+uint64_t AllocAligned(uint64_t address, uint64_t size, Mode mode, uint64_t alignment) {
 	if (alignment == 0) {
 		return 0;
 	}
@@ -235,6 +175,10 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 		ret_addr = reinterpret_cast<uintptr_t>(ptr);
 		if (ptr != MAP_FAILED) {
 #if defined(__APPLE__)
+			// Carve the aligned subrange out of the live mapping with MAP_FIXED (in-place
+			// replacement) and trim the slack; never munmap the whole range first, or a
+			// concurrent host mapping (dyld, Rosetta, Metal) could claim the hole and be
+			// destroyed by the MAP_FIXED. Other platforms keep the original path below.
 			auto aligned_addr = align_up(ret_addr, alignment);
 			// NOLINTNEXTLINE
 			void* fixed = mmap(reinterpret_cast<void*>(aligned_addr), size, protect,
@@ -278,29 +222,31 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 	}
 
 	if (ptr == MAP_FAILED) {
-		return SysVirtualAllocAligned(address, size, mode, alignment << 1u);
+		return AllocAligned(address, size, mode, alignment << 1u);
 	}
 
 	pthread_mutex_lock(&g_virtual_mutex);
 	record_alloc(ret_addr, size);
-	record_protect(ret_addr, size, protect);
 	pthread_mutex_unlock(&g_virtual_mutex);
 
 	return ret_addr;
 }
 
 #if defined(__APPLE__)
+// macOS has no /proc/self/maps; query the Mach VM map directly. mach_vm_region returns
+// the first mapped region at or above `region_addr`; if it begins before the end of the
+// requested range, the range overlaps an existing mapping.
 static bool is_mapped(void* ptr, size_t length) {
-	auto                           query_addr  = reinterpret_cast<vm_address_t>(ptr);
-	vm_address_t                   region_addr = query_addr;
-	vm_size_t                      region_size = 0;
+	auto                           query_addr  = reinterpret_cast<mach_vm_address_t>(ptr);
+	mach_vm_address_t              region_addr = query_addr;
+	mach_vm_size_t                 region_size = 0;
 	vm_region_basic_info_data_64_t info {};
 	mach_msg_type_number_t         count       = VM_REGION_BASIC_INFO_COUNT_64;
 	mach_port_t                    object_name = MACH_PORT_NULL;
 
 	kern_return_t kr =
-	    vm_region_64(mach_task_self(), &region_addr, &region_size, VM_REGION_BASIC_INFO_64,
-	                 reinterpret_cast<vm_region_info_t>(&info), &count, &object_name);
+	    mach_vm_region(mach_task_self(), &region_addr, &region_size, VM_REGION_BASIC_INFO_64,
+	                   reinterpret_cast<vm_region_info_t>(&info), &count, &object_name);
 	if (kr != KERN_SUCCESS) {
 		return false; // no region at or above the address → unmapped
 	}
@@ -333,7 +279,7 @@ static bool is_mapped(void* ptr, size_t length) {
 }
 #endif
 
-bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
+bool AllocFixed(uint64_t address, uint64_t size, Mode mode) {
 	EXIT_IF(g_allocs == nullptr);
 
 	auto addr    = static_cast<uintptr_t>(address);
@@ -362,7 +308,6 @@ bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode m
 	if (ptr != MAP_FAILED) {
 		pthread_mutex_lock(&g_virtual_mutex);
 		record_alloc(ret_addr, size);
-		record_protect(ret_addr, size, protect);
 		pthread_mutex_unlock(&g_virtual_mutex);
 
 		return true;
@@ -371,15 +316,15 @@ bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode m
 	return false;
 }
 
-bool SysVirtualCommit(uint64_t address, uint64_t size, VirtualMemory::Mode mode) {
-	return SysVirtualProtect(address, size, mode);
+bool Commit(uint64_t address, uint64_t size, Mode mode) {
+	return Protect(address, size, mode);
 }
 
-uint64_t SysVirtualReserve(uint64_t address, uint64_t size) {
-	return SysVirtualReserveAligned(address, size, 1);
+uint64_t Reserve(uint64_t address, uint64_t size) {
+	return ReserveAligned(address, size, 1);
 }
 
-uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alignment) {
+uint64_t ReserveAligned(uint64_t address, uint64_t size, uint64_t alignment) {
 	if (alignment == 0) {
 		return 0;
 	}
@@ -400,6 +345,11 @@ uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alig
 		ret_addr = reinterpret_cast<uintptr_t>(ptr);
 		if (ptr != MAP_FAILED) {
 #if defined(__APPLE__)
+			// Carve the aligned subrange out of the live reservation with MAP_FIXED (an
+			// in-place replacement), then trim the slack. The range must never be
+			// returned to the OS in between: another thread (dyld, Rosetta, Metal,
+			// malloc) could claim the hole, and the subsequent MAP_FIXED would silently
+			// destroy its mapping. Other platforms keep the original path below.
 			auto aligned_addr = align_up(ret_addr, alignment);
 			// NOLINTNEXTLINE
 			void* fixed = mmap(reinterpret_cast<void*>(aligned_addr), size, PROT_NONE,
@@ -443,7 +393,7 @@ uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alig
 	}
 
 	if (ptr == MAP_FAILED) {
-		return SysVirtualReserveAligned(address, size, alignment << 1u);
+		return ReserveAligned(address, size, alignment << 1u);
 	}
 
 	pthread_mutex_lock(&g_virtual_mutex);
@@ -453,7 +403,7 @@ uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alig
 	return ret_addr;
 }
 
-bool SysVirtualReserveFixed(uint64_t address, uint64_t size) {
+bool ReserveFixed(uint64_t address, uint64_t size) {
 	EXIT_IF(g_allocs == nullptr);
 
 	auto addr = static_cast<uintptr_t>(address);
@@ -489,8 +439,9 @@ bool SysVirtualReserveFixed(uint64_t address, uint64_t size) {
 	return false;
 }
 
-bool SysVirtualDecommit(uint64_t address, uint64_t size) {
-	if (!SysVirtualProtect(address, size, VirtualMemory::Mode::NoAccess)) {
+bool Decommit(uint64_t address, uint64_t size) {
+	// Drop physical pages while preserving the reservation.
+	if (!Protect(address, size, Mode::NoAccess)) {
 		return false;
 	}
 
@@ -502,6 +453,7 @@ bool SysVirtualDecommit(uint64_t address, uint64_t size) {
 #endif
 		const auto page_size = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
 		if (page_size != 0) {
+			// Do not discard pages outside the requested range.
 			const auto begin = (static_cast<uintptr_t>(address) + page_size - 1) & ~(page_size - 1);
 			const auto end   = (static_cast<uintptr_t>(address) + size) & ~(page_size - 1);
 			if (end > begin) {
@@ -513,7 +465,7 @@ bool SysVirtualDecommit(uint64_t address, uint64_t size) {
 	return true;
 }
 
-bool SysVirtualFree(uint64_t address) {
+bool Free(uint64_t address) {
 	EXIT_IF(g_allocs == nullptr);
 	size_t size = 0;
 
@@ -530,17 +482,10 @@ bool SysVirtualFree(uint64_t address) {
 		return false;
 	}
 
-	if (munmap(reinterpret_cast<void*>(addr), size) == 0) {
-		pthread_mutex_lock(&g_virtual_mutex);
-		record_protect(addr, size, PROT_NONE);
-		pthread_mutex_unlock(&g_virtual_mutex);
-		return true;
-	}
-
-	return false;
+	return munmap(reinterpret_cast<void*>(addr), size) == 0;
 }
 
-bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
+bool FreeRange(uint64_t address, uint64_t size) {
 	EXIT_IF(g_allocs == nullptr);
 	if (size == 0 || (address & 0xfffu) != 0 || (size & 0xfffu) != 0) {
 		return false;
@@ -559,6 +504,7 @@ bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
 		return false;
 	}
 
+	// A reservation may have been split into several adjacent records.
 	auto       first      = std::prev(next);
 	const auto alloc_addr = first->first;
 	if (addr < alloc_addr || alloc_addr + first->second <= addr) {
@@ -591,39 +537,22 @@ bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
 	if (end < alloc_end) {
 		(*g_allocs)[end] = alloc_end - end;
 	}
-	record_protect(addr, size, PROT_NONE);
 	pthread_mutex_unlock(&g_virtual_mutex);
 	return true;
 }
 
-bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode,
-                       VirtualMemory::Mode* old_mode) {
-	auto addr = static_cast<uintptr_t>(address);
-
-	pthread_mutex_lock(&g_virtual_mutex);
-	if (old_mode != nullptr) {
-		*old_mode = get_protection_flag(protection_at(addr));
-	}
-	pthread_mutex_unlock(&g_virtual_mutex);
-
-	uintptr_t page_start = addr >> 12u;
-	uintptr_t page_end   = (addr + size - 1) >> 12u;
-	if (mprotect(reinterpret_cast<void*>(page_start << 12u), (page_end - page_start + 1) << 12u,
-	             get_protection_flag(mode)) == 0) {
-		pthread_mutex_lock(&g_virtual_mutex);
-		record_protect(page_start << 12u, (page_end - page_start + 1) << 12u,
-		               get_protection_flag(mode));
-		pthread_mutex_unlock(&g_virtual_mutex);
-		return true;
-	}
-
-	return false;
+bool Protect(uint64_t address, uint64_t size, Mode mode) {
+	const auto addr       = static_cast<uintptr_t>(address);
+	const auto page_start = addr >> 12u;
+	const auto page_end   = (addr + size - 1) >> 12u;
+	return mprotect(reinterpret_cast<void*>(page_start << 12u), (page_end - page_start + 1) << 12u,
+	                get_protection_flag(mode)) == 0;
 }
 
-bool SysVirtualFlushInstructionCache(uint64_t /*address*/, uint64_t /*size*/) {
+bool FlushInstructionCache(uint64_t /*address*/, uint64_t /*size*/) {
 	return true;
 }
 
-} // namespace Common
+} // namespace Common::VirtualMemory
 
 #endif

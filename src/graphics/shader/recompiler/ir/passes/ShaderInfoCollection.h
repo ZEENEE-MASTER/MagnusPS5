@@ -5,14 +5,10 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-struct ShaderInfoOptions {
-	const ShaderVertexInputInfo*  vertex  = nullptr;
-	const ShaderPixelInputInfo*   pixel   = nullptr;
-	const ShaderComputeInputInfo* compute = nullptr;
-};
+// Completes the immutable shader interface after resource tracking. On failure Program::info and
+// all completion state remain unchanged.
+void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info);
 
-bool CollectShaderInfo(Program& program, const ShaderInfoOptions& options, std::string* error);
+} // namespace Libs::Graphics::ShaderRecompiler::IR
 
-}
-
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERINFOCOLLECTION_H_ */

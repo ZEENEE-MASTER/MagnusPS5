@@ -53,41 +53,8 @@ struct sys_file_t {
 #define KYTY_STAT_MTIME_NS(st) ((st).st_mtim.tv_nsec)
 #endif
 
-#if defined(__APPLE__)
-static bool names_the_host(const std::filesystem::path& name) {
-	static const char* const host_roots[] = {"/var",     "/private", "/tmp",  "/usr",
-	                                         "/System",  "/Library", "/dev",  "/Applications",
-	                                         "/bin",     "/sbin",    "/etc",  "/cores"};
-	const auto text = name.string();
-	if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
-		if (text.rfind(home, 0) == 0) {
-			return true;
-		}
-	}
-	for (const char* root: host_roots) {
-		const auto length = std::strlen(root);
-		if (text.rfind(root, 0) == 0 && (text.size() == length || text[length] == '/')) {
-			return true;
-		}
-	}
-	return false;
-}
-#endif
-
 static std::filesystem::path get_internal_name(const std::filesystem::path& name) {
-	if (!name.is_absolute()) {
-		return std::filesystem::path(".") / name;
-	}
-#if defined(__APPLE__)
-	if (!names_the_host(name)) {
-		std::error_code error;
-		auto            root = std::filesystem::current_path(error) / "guestfs";
-		if (!error) {
-			return root / name.relative_path();
-		}
-	}
-#endif
-	return name;
+	return name.is_absolute() ? name : (std::filesystem::path(".") / name);
 }
 
 // Pass access-pattern hints to the host.
@@ -183,10 +150,6 @@ void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* byte
 			*bytes_written = size;
 		}
 	}
-}
-
-void SysFileWrite(uint32_t n, sys_file_t& f) {
-	SysFileWrite(&n, 4, f);
 }
 
 sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
@@ -647,51 +610,6 @@ bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
 	//	}
 }
 
-// Recursively collect regular files.
-void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_find_t>& out) {
-	auto real_path = get_internal_name(path);
-
-	DIR* dir = opendir(real_path.string().c_str());
-	if (dir == nullptr) {
-		return;
-	}
-
-	for (const dirent* entry = readdir(dir); entry != nullptr; entry = readdir(dir)) {
-		const std::string file_name(entry->d_name);
-
-		if (file_name == "." || file_name == "..") {
-			continue;
-		}
-
-		auto        child = real_path / file_name;
-		struct stat s {};
-
-		// lstat, so a symlink is never followed into a cycle during the recursive walk.
-		if (0 != lstat(child.string().c_str(), &s)) {
-			continue;
-		}
-
-		if (S_ISDIR(s.st_mode)) {
-			SysFileFindFiles(child, out);
-		} else if (S_ISREG(s.st_mode)) {
-			sys_file_find_t r {};
-
-			r.path_with_name              = child;
-			r.size                        = static_cast<uint64_t>(s.st_size);
-			r.last_access_time.is_invalid = false;
-			r.last_access_time.time       = s.st_atime;
-			r.last_access_time.nanos      = KYTY_STAT_ATIME_NS(s);
-			r.last_write_time.is_invalid  = false;
-			r.last_write_time.time        = s.st_mtime;
-			r.last_write_time.nanos       = KYTY_STAT_MTIME_NS(s);
-
-			out.push_back(r);
-		}
-	}
-
-	closedir(dir);
-}
-
 // Keep "." and ".." to match FindFirstFileW.
 void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out) {
 	auto real_path = get_internal_name(path);
@@ -727,7 +645,7 @@ bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::pa
 	       !error;
 }
 
-bool SysFileMoveFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
+bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
 	auto real_src = get_internal_name(src);
 	auto real_dst = get_internal_name(dst);
 

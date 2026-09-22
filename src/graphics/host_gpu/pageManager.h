@@ -24,12 +24,6 @@ public:
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
-	void OnGpuMap(uint64_t vaddr, uint64_t size);
-	void OnGpuUnmap(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] uint32_t WatcherState(uint64_t vaddr) const noexcept;
-	[[nodiscard]] bool RestoreProtection(uint64_t vaddr) noexcept;
-	[[nodiscard]] bool NoteFault(uint64_t vaddr) noexcept;
-	[[nodiscard]] bool HasHotPage(uint64_t vaddr, uint64_t size) const noexcept;
 
 private:
 	struct Impl;

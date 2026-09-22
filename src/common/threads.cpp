@@ -1,26 +1,20 @@
 #include "common/threads.h"
 
 #include "common/assert.h"
-#include "common/debug.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>             // IWYU pragma: keep
 #include <condition_variable> // IWYU pragma: keep
-#include <cstdio>
-#include <limits>
 #include <mutex>
-#include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && KYTY_COMPILER == KYTY_COMPILER_CLANG
 #define KYTY_WIN_CS
 #endif
 
-#if defined(__APPLE__)
-#define KYTY_MACH_HIGH_RES_SLEEP
-#include <mach/mach_time.h>
-#elif KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// macOS has no clock_nanosleep.
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && !defined(__APPLE__)
 #define KYTY_POSIX_HIGH_RES_SLEEP
 #include <ctime>
 #endif
@@ -44,6 +38,9 @@ static void SleepHighResolution100ns(uint64_t units_100ns) {
 		return;
 	}
 
+	// Keep spinning only where a kernel transition is
+	// likely to cost more than the requested delay; ordinary millisecond sleeps use the
+	// per-thread high-resolution waitable timer below.
 	if (units_100ns <= KYTY_SLEEP_SPIN_LIMIT_100NS) {
 		LARGE_INTEGER frequency {};
 		LARGE_INTEGER start {};
@@ -133,60 +130,8 @@ static SleepConditionVariableCS_func_t ResolveSleepConditionVariableCS() {
 
 #endif
 
-#ifdef KYTY_MACH_HIGH_RES_SLEEP
-static void SleepMachNanos(uint64_t nanos) {
-	if (nanos == 0) {
-		return;
-	}
-
-	struct Timebase {
-		mach_timebase_info_data_t value {};
-		kern_return_t             result = KERN_FAILURE;
-	};
-	static const Timebase timebase = [] {
-		Timebase result {};
-		result.result = mach_timebase_info(&result.value);
-		return result;
-	}();
-
-	auto fallback = [nanos] {
-		const auto maximum = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
-		std::this_thread::sleep_for(
-		    std::chrono::nanoseconds(static_cast<int64_t>(std::min(nanos, maximum))));
-	};
-
-	if (timebase.result != KERN_SUCCESS || timebase.value.numer == 0 || timebase.value.denom == 0) {
-		static std::atomic<bool> reported {false};
-		if (!reported.exchange(true, std::memory_order_relaxed)) {
-			std::fprintf(stderr, "Magnus:Timer:Error: mach_timebase_info failed rc=%d numer=%u denom=%u\n",
-			             timebase.result, timebase.value.numer, timebase.value.denom);
-			std::fflush(stderr);
-		}
-		fallback();
-		return;
-	}
-
-	const auto converted =
-	    (static_cast<unsigned __int128>(nanos) * timebase.value.denom + timebase.value.numer - 1) /
-	    timebase.value.numer;
-	const auto now       = mach_absolute_time();
-	const auto available = std::numeric_limits<uint64_t>::max() - now;
-	const auto ticks = converted > available ? available : static_cast<uint64_t>(converted);
-	const auto result = mach_wait_until(now + ticks);
-	if (result != KERN_SUCCESS) {
-		static std::atomic<uint64_t> failures {0};
-		const auto count = failures.fetch_add(1, std::memory_order_relaxed) + 1;
-		if (count == 1 || count % 60 == 0) {
-			std::fprintf(stderr, "Magnus:Timer:Error: mach_wait_until failed rc=%d count=%llu\n", result,
-			             static_cast<unsigned long long>(count));
-			std::fflush(stderr);
-		}
-		fallback();
-	}
-}
-#endif
-
 #ifdef KYTY_POSIX_HIGH_RES_SLEEP
+// Spin for very short waits; use an absolute deadline for longer waits.
 static void SleepHighResolutionNanos(uint64_t nanos) {
 	if (nanos == 0) {
 		return;
@@ -251,37 +196,7 @@ struct CondVarPrivate {
 #endif
 };
 
-static std::recursive_mutex                         g_cond_waiters_mutex;
-static std::vector<std::pair<int, CondVarPrivate*>> g_cond_waiters;
-static wait_poll_func_t                             g_cond_wait_poll_callback = nullptr;
-
-static void WakeCondVar(CondVarPrivate* cond_var) {
-#ifdef KYTY_WIN_CS
-	static auto func = ResolveWakeAllConditionVariable();
-	EXIT_NOT_IMPLEMENTED(func == nullptr);
-	func(&cond_var->m_cv);
-#else
-	cond_var->m_cv.notify_all();
-#endif
-}
-
-static void RegisterCondWaiter(CondVarPrivate* cond_var) {
-	std::lock_guard lock(g_cond_waiters_mutex);
-	g_cond_waiters.emplace_back(Thread::GetThreadIdUnique(), cond_var);
-}
-
-static void UnregisterCondWaiter(CondVarPrivate* cond_var) {
-	const auto      thread_id = Thread::GetThreadIdUnique();
-	std::lock_guard lock(g_cond_waiters_mutex);
-
-	const auto it = std::find_if(g_cond_waiters.begin(), g_cond_waiters.end(),
-	                             [thread_id, cond_var](const auto& waiter) {
-		                             return waiter.first == thread_id && waiter.second == cond_var;
-	                             });
-	if (it != g_cond_waiters.end()) {
-		g_cond_waiters.erase(it);
-	}
-}
+static wait_poll_func_t g_cond_wait_poll_callback = nullptr;
 
 struct ThreadPrivate {
 	ThreadPrivate(thread_func_t f, void* a): func(f), arg(a), m_thread(&Run, this) {}
@@ -338,15 +253,9 @@ void Thread::Detach() {
 	m_thread->m_thread.detach();
 }
 
-void Thread::Sleep(uint32_t millis) {
-	std::this_thread::sleep_for(std::chrono::milliseconds(millis));
-}
-
 void Thread::SleepMicro(uint32_t micros) {
 #ifdef KYTY_WIN_CS
 	SleepHighResolution100ns(static_cast<uint64_t>(micros) * 10);
-#elif defined(KYTY_MACH_HIGH_RES_SLEEP)
-	SleepMachNanos(static_cast<uint64_t>(micros) * 1000);
 #elif defined(KYTY_POSIX_HIGH_RES_SLEEP)
 	SleepHighResolutionNanos(static_cast<uint64_t>(micros) * 1000);
 #else
@@ -357,8 +266,6 @@ void Thread::SleepMicro(uint32_t micros) {
 void Thread::SleepNano(uint64_t nanos) {
 #ifdef KYTY_WIN_CS
 	SleepHighResolution100ns((nanos + 99) / 100);
-#elif defined(KYTY_MACH_HIGH_RES_SLEEP)
-	SleepMachNanos(nanos);
 #elif defined(KYTY_POSIX_HIGH_RES_SLEEP)
 	SleepHighResolutionNanos(nanos);
 #else
@@ -423,7 +330,6 @@ CondVar::~CondVar() {
 }
 
 void CondVar::Wait(Mutex* mutex) {
-	RegisterCondWaiter(m_cond_var.get());
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
@@ -464,7 +370,6 @@ void CondVar::Wait(Mutex* mutex) {
 	}
 	cpp_lock.release();
 #endif
-	UnregisterCondWaiter(m_cond_var.get());
 }
 
 void CondVar::SetWaitPollCallback(wait_poll_func_t callback) {
@@ -473,7 +378,6 @@ void CondVar::SetWaitPollCallback(wait_poll_func_t callback) {
 
 bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 	bool ok = false;
-	RegisterCondWaiter(m_cond_var.get());
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
@@ -488,7 +392,6 @@ bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 	      std::cv_status::no_timeout);
 	cpp_lock.release();
 #endif
-	UnregisterCondWaiter(m_cond_var.get());
 	return ok;
 }
 
@@ -503,16 +406,13 @@ void CondVar::Signal() {
 }
 
 void CondVar::SignalAll() {
-	WakeCondVar(m_cond_var.get());
-}
-
-void CondVar::SignalThread(int thread_id) {
-	std::lock_guard lock(g_cond_waiters_mutex);
-	for (const auto& waiter: g_cond_waiters) {
-		if (waiter.first == thread_id) {
-			WakeCondVar(waiter.second);
-		}
-	}
+#ifdef KYTY_WIN_CS
+	static auto func = ResolveWakeAllConditionVariable();
+	EXIT_NOT_IMPLEMENTED(func == nullptr);
+	func(&m_cond_var->m_cv);
+#else
+	m_cond_var->m_cv.notify_all();
+#endif
 }
 
 int Thread::GetThreadIdUnique() {

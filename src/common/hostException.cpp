@@ -2,18 +2,20 @@
 
 #include <atomic>
 #include <cstdio>
-#include <cstdlib>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
-#elif defined(__APPLE__)
+#else
+#include <algorithm>
 #include <csignal>
+#include <cstdlib>
+#include <initializer_list>
+#include <unistd.h>
+#if defined(__APPLE__)
 #include <sys/ucontext.h>
 #else
-#include <csignal>
-#include <initializer_list>
 #include <ucontext.h> // IWYU pragma: keep
-#include <unistd.h>
+#endif
 #endif
 
 // IWYU pragma: no_include <errhandlingapi.h>
@@ -22,17 +24,7 @@
 // IWYU pragma: no_include <minwindef.h>
 // IWYU pragma: no_include <wtypes.h>
 
-extern "C" bool StingerFixUnalignedFault(void* context);
-
 namespace Common::HostException {
-
-static std::atomic<GuestRegisterReader> g_guest_registers {nullptr};
-
-static_assert(decltype(g_guest_registers)::is_always_lock_free);
-
-void SetGuestRegisterReader(GuestRegisterReader reader) {
-	g_guest_registers.store(reader, std::memory_order_release);
-}
 
 #if !defined(__APPLE__)
 
@@ -41,6 +33,51 @@ static std::atomic_uint32_t g_install_state {0};
 
 static_assert(decltype(g_handler)::is_always_lock_free);
 static_assert(decltype(g_install_state)::is_always_lock_free);
+#endif
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+
+// macOS uses the same POSIX platform setting and needs a signal stack too.
+class ThreadSignalStack {
+public:
+	ThreadSignalStack() {
+		const auto page_size = static_cast<size_t>(::getpagesize());
+		const auto stack_size =
+		    (std::max<size_t>(64 * 1024, MINSIGSTKSZ) + page_size - 1) & ~(page_size - 1);
+		if (::posix_memalign(&m_memory, page_size, stack_size) != 0) {
+			return;
+		}
+
+		stack_t stack {};
+		stack.ss_sp   = m_memory;
+		stack.ss_size = stack_size;
+		if (::sigaltstack(&stack, &m_previous) != 0) {
+			std::free(m_memory);
+			m_memory = nullptr;
+		}
+	}
+
+	~ThreadSignalStack() {
+		if (m_memory != nullptr && ::sigaltstack(&m_previous, nullptr) == 0) {
+			std::free(m_memory);
+		}
+	}
+
+	[[nodiscard]] bool IsInitialized() const { return m_memory != nullptr; }
+
+	KYTY_CLASS_NO_COPY(ThreadSignalStack)
+
+private:
+	void*   m_memory = nullptr;
+	stack_t m_previous {};
+};
+
+bool InitializeThreadSignalStack() {
+	// Keep fault handling off guest stacks, which GPU tracking can make read-only.
+	thread_local ThreadSignalStack signal_stack;
+	return signal_stack.IsInitialized();
+}
+
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -110,31 +147,6 @@ static std::atomic_uint32_t g_install_state {0};
 static_assert(decltype(g_handler)::is_always_lock_free);
 static_assert(decltype(g_install_state)::is_always_lock_free);
 
-static struct sigaction g_previous_segv {};
-static struct sigaction g_previous_bus {};
-static struct sigaction g_previous_ill {};
-
-static void ChainToPrevious(int sig, siginfo_t* si, void* uctx) {
-	const struct sigaction& previous = sig == SIGBUS    ? g_previous_bus
-	                                   : sig == SIGILL  ? g_previous_ill
-	                                                    : g_previous_segv;
-	if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) {
-		previous.sa_sigaction(sig, si, uctx);
-		return;
-	}
-	if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN &&
-	    previous.sa_handler != nullptr) {
-		previous.sa_handler(sig);
-		return;
-	}
-	struct sigaction dfl {};
-	dfl.sa_handler = SIG_DFL;
-	sigemptyset(&dfl.sa_mask);
-	sigaction(sig, &dfl, nullptr);
-}
-
-#if defined(__x86_64__)
-
 // Translate the x86-64 page-fault error code (mcontext __es.__err) into an access type.
 // bit 1 (0x2) = write, bit 4 (0x10) = instruction fetch, otherwise a read.
 static AccessViolationType DecodeAccess(uint64_t err) {
@@ -147,43 +159,6 @@ static AccessViolationType DecodeAccess(uint64_t err) {
 	return AccessViolationType::Read;
 }
 
-#else
-
-// Read the access type out of the syndrome register (mcontext __es.__esr). EC (bits 26-31)
-// 0x20/0x21 is an instruction abort; 0x24/0x25 is a data abort whose WnR bit separates
-// write from read.
-static AccessViolationType DecodeAccess(uint64_t esr) {
-	const auto ec = (esr >> 26u) & 0x3fu;
-	if (ec == 0x20u || ec == 0x21u) {
-		return AccessViolationType::Execute;
-	}
-	if ((ec == 0x24u || ec == 0x25u) && ((esr >> 6u) & 0x1u) != 0) {
-		return AccessViolationType::Write;
-	}
-	return AccessViolationType::Read;
-}
-
-// The syndrome carries the fault CLASS in its low six bits, and a handler that only reads
-// the direction bit cannot tell a permission fault from one it can never fix. MAGNUS_ESR=1.
-static const bool g_report_syndrome = std::getenv("MAGNUS_ESR") != nullptr;
-static std::atomic<uint64_t> g_syndrome_reports {0};
-
-static void ReportSyndrome(int sig, const siginfo_t* si, uint64_t esr, uint64_t pc) {
-	if (!g_report_syndrome || g_syndrome_reports.fetch_add(1, std::memory_order_relaxed) >= 4) {
-		return;
-	}
-	std::fprintf(stderr,
-	             "Magnus:Fault:Info: sig=%d code=%d at=%p pc=0x%016llx esr=0x%016llx ec=0x%02llx "
-	             "dfsc=0x%02llx wnr=%llu\n",
-	             sig, si != nullptr ? si->si_code : 0, si != nullptr ? si->si_addr : nullptr,
-	             static_cast<unsigned long long>(pc), static_cast<unsigned long long>(esr),
-	             static_cast<unsigned long long>((esr >> 26u) & 0x3fu),
-	             static_cast<unsigned long long>(esr & 0x3fu),
-	             static_cast<unsigned long long>((esr >> 6u) & 0x1u));
-}
-
-#endif
-
 // POSIX signal handler that mirrors the Windows vectored handler: build an ExceptionInfo
 // from the mcontext and dispatch. A resolved fault (handler returns true) simply returns,
 // re-executing the faulting instruction against the now-fixed protection. An unresolved
@@ -194,68 +169,45 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 	const auto& ss = mc->__ss;
 
 	ExceptionInfo info {};
-	info.native_code    = static_cast<uint32_t>(si->si_code);
-	info.native_context = uctx;
+	info.exception_address = ss.__rip;
+	info.native_code       = static_cast<uint32_t>(si->si_code);
+	info.native_context    = uctx;
 
 	if (sig == SIGILL) {
 		info.type = ExceptionType::IllegalInstruction;
 	} else {
-		info.type = ExceptionType::AccessViolation;
-#if defined(__x86_64__)
-		info.access_violation_type = DecodeAccess(mc->__es.__err);
-#else
-		info.access_violation_type = DecodeAccess(mc->__es.__esr);
-		ReportSyndrome(sig, si, mc->__es.__esr, ss.__pc);
-		const auto esr = mc->__es.__esr;
-		const auto fault_class = (esr >> 26u) & 0x3fu;
-		if ((fault_class == 0x24u || fault_class == 0x25u) && (esr & 0x3fu) == 0x21u) {
-			if (StingerFixUnalignedFault(uctx)) {
-				return;
-			}
-			std::fprintf(stderr,
-			             "Magnus:Fault:Error: unaligned access the CPU layer declined, at=%p "
-			             "pc=0x%016llx esr=0x%016llx\n",
-			             si != nullptr ? si->si_addr : nullptr,
-			             static_cast<unsigned long long>(ss.__pc),
-			             static_cast<unsigned long long>(esr));
-			ChainToPrevious(sig, si, uctx);
-			return;
-		}
-#endif
+		info.type                   = ExceptionType::AccessViolation;
+		info.access_violation_type  = DecodeAccess(mc->__es.__err);
 		info.access_violation_vaddr = reinterpret_cast<uint64_t>(si->si_addr);
 	}
 
-#if defined(__x86_64__)
-	info.exception_address = ss.__rip;
-	info.rax               = ss.__rax;
-	info.rbx               = ss.__rbx;
-	info.rcx               = ss.__rcx;
-	info.rdx               = ss.__rdx;
-	info.rsi               = ss.__rsi;
-	info.rdi               = ss.__rdi;
-	info.rbp               = ss.__rbp;
-	info.rsp               = ss.__rsp;
-	info.r8                = ss.__r8;
-	info.r9                = ss.__r9;
-	info.r10               = ss.__r10;
-	info.r11               = ss.__r11;
-	info.r12               = ss.__r12;
-	info.r13               = ss.__r13;
-	info.r14               = ss.__r14;
-	info.r15               = ss.__r15;
-	info.guest_registers_valid = true;
-#else
-	(void)ss;
-	const auto registers       = g_guest_registers.load(std::memory_order_acquire);
-	info.guest_registers_valid = registers != nullptr && registers(uctx, info);
-#endif
+	info.rax = ss.__rax;
+	info.rbx = ss.__rbx;
+	info.rcx = ss.__rcx;
+	info.rdx = ss.__rdx;
+	info.rsi = ss.__rsi;
+	info.rdi = ss.__rdi;
+	info.rbp = ss.__rbp;
+	info.rsp = ss.__rsp;
+	info.r8  = ss.__r8;
+	info.r9  = ss.__r9;
+	info.r10 = ss.__r10;
+	info.r11 = ss.__r11;
+	info.r12 = ss.__r12;
+	info.r13 = ss.__r13;
+	info.r14 = ss.__r14;
+	info.r15 = ss.__r15;
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
 		return; // retry the faulting instruction against the fixed mapping
 	}
 
-	ChainToPrevious(sig, si, uctx);
+	// Unresolved: restore the default action so the re-executed instruction terminates.
+	struct sigaction dfl {};
+	dfl.sa_handler = SIG_DFL;
+	sigemptyset(&dfl.sa_mask);
+	sigaction(sig, &dfl, nullptr);
 }
 
 #else
@@ -349,7 +301,7 @@ bool InstallHandler(Handler handler) {
 #elif defined(__APPLE__)
 	struct sigaction sa {};
 	sa.sa_sigaction = SignalHandler;
-	sa.sa_flags     = SA_SIGINFO;
+	sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
 	sigemptyset(&sa.sa_mask);
 	// The guest signal-dispatch path (KernelRaiseException) interrupts threads with
 	// SIGUSR1; block it while a fault is being resolved so a stop-the-world request
@@ -358,9 +310,8 @@ bool InstallHandler(Handler handler) {
 
 	// macOS raises SIGBUS for protection faults on some paths and SIGSEGV on others;
 	// SIGILL covers instructions the host cannot execute (routed to the x64 emulator).
-	bool ok = sigaction(SIGSEGV, &sa, &g_previous_segv) == 0 &&
-	          sigaction(SIGBUS, &sa, &g_previous_bus) == 0 &&
-	          sigaction(SIGILL, &sa, &g_previous_ill) == 0;
+	bool ok = sigaction(SIGSEGV, &sa, nullptr) == 0 && sigaction(SIGBUS, &sa, nullptr) == 0 &&
+	          sigaction(SIGILL, &sa, nullptr) == 0;
 	if (!ok) {
 		g_handler.store(nullptr, std::memory_order_release);
 		g_install_state.store(0, std::memory_order_release);
@@ -371,8 +322,7 @@ bool InstallHandler(Handler handler) {
 	struct sigaction action {};
 	action.sa_sigaction = SignalHandler;
 	sigemptyset(&action.sa_mask);
-	// Fault resolution needs the normal thread stack.
-	action.sa_flags = SA_SIGINFO | SA_RESTART;
+	action.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
 
 	for (const int signal_number: {SIGSEGV, SIGBUS, SIGILL}) {
 		if (::sigaction(signal_number, &action, nullptr) != 0) {

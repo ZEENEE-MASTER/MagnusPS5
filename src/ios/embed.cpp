@@ -103,8 +103,8 @@ void BootThread(std::filesystem::path app0) {
 
 	Emulator::RunOptions options;
 	options.config.printf_direction = ::getenv("MAGNUS_VERBOSE") != nullptr
-	                                      ? Config::OutputDirection::Console
-	                                      : Config::OutputDirection::Silent;
+	                                      ? Config::LogDirection::Console
+	                                      : Config::LogDirection::Silent;
 
 	uint32_t width  = 0;
 	uint32_t height = 0;

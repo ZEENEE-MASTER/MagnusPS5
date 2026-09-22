@@ -7,6 +7,9 @@ namespace Libs::Audio {
 
 void Initialize();
 void Shutdown();
+
+// Magnus iOS: master volume 0-100 for iPhone speaker / AirPods.
+// Implemented in src/ios/controller_shim.cpp (TODO: wire to AudioOut).
 void SetMasterVolume(int percent);
 
 struct Lifecycle {
@@ -97,11 +100,15 @@ int KYTY_SYSV_ABI AudioOut2MasteringTerm();
 
 namespace AudioIn {
 
-int KYTY_SYSV_ABI AudioInOpen(int user_id, uint32_t type, uint32_t index, uint32_t len,
+int KYTY_SYSV_ABI AudioInOpen(int user_id, int type, int index, uint32_t len,
                               uint32_t freq, uint32_t param);
+int KYTY_SYSV_ABI AudioInHqOpen(int user_id, int type, int index, uint32_t len,
+                                uint32_t freq, uint32_t param);
+int KYTY_SYSV_ABI AudioInClose(int handle);
 int KYTY_SYSV_ABI AudioInInput(int handle, void* dest);
 int KYTY_SYSV_ABI AudioInGetSilentState(int handle);
 
+// Magnus iOS mic capture (iPhone mic -> game). TODO: wire to AudioIn.
 void CapturePush(const int16_t* frames, uint32_t count);
 void CaptureReset();
 
@@ -337,7 +344,7 @@ int KYTY_SYSV_ABI Ngs2RackGetVoiceHandle(uintptr_t rack_handle, uint32_t voice_i
                                          uintptr_t* handle);
 int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamHeader* param_list);
 int KYTY_SYSV_ABI Ngs2VoiceRunCommands(uintptr_t voice_handle, const void* commands,
-                                       uint32_t num_commands, uint32_t flags);
+                                       size_t num_commands);
 int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* state,
                                     size_t state_size);
 int KYTY_SYSV_ABI Ngs2VoiceGetStateFlags(uintptr_t voice_handle, uint32_t* state_flags);

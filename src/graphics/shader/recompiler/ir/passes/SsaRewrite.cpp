@@ -15,6 +15,10 @@ struct ThreadBitScalarReg {
 	ScalarReg reg {};
 	auto      operator<=>(const ThreadBitScalarReg&) const = default;
 };
+struct ScalarMaskTag {
+	ScalarReg reg {};
+	auto      operator<=>(const ScalarMaskTag&) const = default;
+};
 struct ExecTag {
 	auto operator<=>(const ExecTag&) const = default;
 };
@@ -41,8 +45,9 @@ struct GotoVariable {
 	auto     operator<=>(const GotoVariable&) const = default;
 };
 
-using Variable = std::variant<ScalarReg, ThreadBitScalarReg, VectorReg, GotoVariable, SccTag,
-                              ExecTag, ExecLoTag, ExecHiTag, VccTag, VccLoTag, VccHiTag, M0Tag>;
+using Variable =
+    std::variant<ScalarReg, ThreadBitScalarReg, ScalarMaskTag, VectorReg, GotoVariable, SccTag,
+                 ExecTag, ExecLoTag, ExecHiTag, VccTag, VccLoTag, VccHiTag, M0Tag>;
 using ValueMap = std::unordered_map<Block*, Value>;
 
 struct DefTable {
@@ -65,6 +70,14 @@ struct DefTable {
 	void Set(Block* block, ThreadBitScalarReg value, Value definition) {
 		EXIT_IF(RegIndex(value.reg) >= NumScalarRegs);
 		block->ssa_thread_bit_sreg_values[RegIndex(value.reg)] = definition;
+	}
+	const Value& Get(Block* block, ScalarMaskTag value) {
+		EXIT_IF(RegIndex(value.reg) >= NumScalarRegs);
+		return block->ssa_sreg_mask_tags[RegIndex(value.reg)];
+	}
+	void Set(Block* block, ScalarMaskTag value, Value definition) {
+		EXIT_IF(RegIndex(value.reg) >= NumScalarRegs);
+		block->ssa_sreg_mask_tags[RegIndex(value.reg)] = definition;
 	}
 
 	const Value& Get(Block* block, VectorReg reg) {
@@ -110,47 +123,13 @@ struct DefTable {
 	std::unordered_map<uint32_t, ValueMap> goto_variables;
 };
 
-ValueOpcode UndefOpcode(ScalarReg) {
-	return ValueOpcode::UndefU32;
-}
-ValueOpcode UndefOpcode(ThreadBitScalarReg) {
-	return ValueOpcode::UndefU1;
-}
-ValueOpcode UndefOpcode(VectorReg) {
-	return ValueOpcode::UndefU32;
-}
-ValueOpcode UndefOpcode(GotoVariable) {
-	return ValueOpcode::UndefU1;
-}
-ValueOpcode UndefOpcode(SccTag) {
-	return ValueOpcode::UndefU1;
-}
-ValueOpcode UndefOpcode(ExecTag) {
-	return ValueOpcode::UndefU1;
-}
-ValueOpcode UndefOpcode(ExecLoTag) {
-	return ValueOpcode::UndefU32;
-}
-ValueOpcode UndefOpcode(ExecHiTag) {
-	return ValueOpcode::UndefU32;
-}
-ValueOpcode UndefOpcode(VccTag) {
-	return ValueOpcode::UndefU1;
-}
-ValueOpcode UndefOpcode(VccLoTag) {
-	return ValueOpcode::UndefU32;
-}
-ValueOpcode UndefOpcode(VccHiTag) {
-	return ValueOpcode::UndefU32;
-}
-ValueOpcode UndefOpcode(M0Tag) {
-	return ValueOpcode::UndefU32;
-}
-
 Value InitialValue(ScalarReg) {
 	return Value(0u);
 }
 Value InitialValue(ThreadBitScalarReg) {
+	return Value(false);
+}
+Value InitialValue(ScalarMaskTag) {
 	return Value(false);
 }
 Value InitialValue(VectorReg) {
@@ -229,7 +208,7 @@ public:
 						state.result = def;
 					} else if (!block->IsSsaSealed()) {
 						auto& phi = *block->PrependNewInst(block->begin(), ValueOpcode::Phi);
-						phi.SetFlags(TypeOf(UndefOpcode(variable)));
+						phi.SetFlags(InitialValue(variable).GetType());
 						incomplete_phis[block][Variable(variable)] = &phi;
 						state.result                               = Value(&phi);
 					} else if (const auto predecessors = block->ImmPredecessors();
@@ -239,7 +218,7 @@ public:
 						break;
 					} else {
 						auto& phi = *block->PrependNewInst(block->begin(), ValueOpcode::Phi);
-						phi.SetFlags(TypeOf(UndefOpcode(variable)));
+						phi.SetFlags(InitialValue(variable).GetType());
 						Write(variable, block, Value(&phi));
 						state.phi = &phi;
 						prepare_phi();
@@ -321,6 +300,9 @@ void VisitInstruction(Pass& pass, Block* block, Inst& inst) {
 		case ValueOpcode::SetThreadBitScalarRegister:
 			pass.Write(ThreadBitScalarReg {inst.Arg(0).ScalarRegister()}, block, inst.Arg(1));
 			break;
+		case ValueOpcode::SetScalarMaskTag:
+			pass.Write(ScalarMaskTag {inst.Arg(0).ScalarRegister()}, block, inst.Arg(1));
+			break;
 		case ValueOpcode::SetVectorRegister:
 			pass.Write(inst.Arg(0).VectorRegister(), block, inst.Arg(1));
 			break;
@@ -341,6 +323,9 @@ void VisitInstruction(Pass& pass, Block* block, Inst& inst) {
 		case ValueOpcode::GetThreadBitScalarRegister:
 			inst.ReplaceUsesWith(
 			    pass.Read(ThreadBitScalarReg {inst.Arg(0).ScalarRegister()}, block));
+			break;
+		case ValueOpcode::GetScalarMaskTag:
+			inst.ReplaceUsesWith(pass.Read(ScalarMaskTag {inst.Arg(0).ScalarRegister()}, block));
 			break;
 		case ValueOpcode::GetVectorRegister:
 			inst.ReplaceUsesWith(pass.Read(inst.Arg(0).VectorRegister(), block));

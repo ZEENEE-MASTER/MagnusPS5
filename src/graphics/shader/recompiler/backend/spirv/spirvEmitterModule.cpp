@@ -1,65 +1,292 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include <algorithm>
+#include <bit>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
-const IR::DescriptorBinding* DescriptorBinding(const EmitterState&       state,
-                                               IR::DescriptorBindingKind kind) {
-	return IR::FindBinding(state.program.bindings, kind);
+uint32_t TypeVoid(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeVoid);
 }
 
-uint32_t DescriptorCount(const EmitterState& state, IR::DescriptorBindingKind kind) {
-	const auto* binding = DescriptorBinding(state, kind);
-	return binding != nullptr ? static_cast<uint32_t>(binding->resources.size()) : 0;
+uint32_t TypeBool(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeBool);
 }
+
+uint32_t TypeBoolVector(EmitterState& state, uint32_t components) {
+	return state.builder.Type(spv::OpTypeVector, TypeBool(state), components);
+}
+
+uint32_t TypeU32(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeInt, 32, 0);
+}
+
+uint32_t TypeU64(EmitterState& state) {
+	return TypeU32Vector(state, 2);
+}
+
+uint32_t TypeScalarU64(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeInt, 64, 0);
+}
+
+uint32_t TypeU32Pair(EmitterState& state) {
+	const auto element = TypeU32(state);
+	return state.builder.Type(spv::OpTypeStruct, element, element);
+}
+
+uint32_t TypeI32(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeInt, 32, 1);
+}
+
+uint32_t TypeI32Pair(EmitterState& state) {
+	const auto element = TypeI32(state);
+	return state.builder.Type(spv::OpTypeStruct, element, element);
+}
+
+uint32_t TypeF32(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeFloat, 32);
+}
+
+uint32_t TypeU32Vector(EmitterState& state, uint32_t components) {
+	return state.builder.Type(spv::OpTypeVector, TypeU32(state), components);
+}
+
+uint32_t TypeU32Composite(EmitterState& state, uint32_t components) {
+	EXIT_IF(components < 2u || components > 4u);
+	return components == 2u ? TypeU32Pair(state) : TypeU32Vector(state, components);
+}
+
+uint32_t TypeI32Vector(EmitterState& state, uint32_t components) {
+	return state.builder.Type(spv::OpTypeVector, TypeI32(state), components);
+}
+
+uint32_t TypeF32Vector(EmitterState& state, uint32_t components) {
+	return state.builder.Type(spv::OpTypeVector, TypeF32(state), components);
+}
+
+uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee) {
+	return state.builder.Type(spv::OpTypePointer, storage_class, pointee);
+}
+
+uint32_t TypeFunction(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeFunction, TypeVoid(state));
+}
+
+uint32_t StorageRuntimeArrayType(EmitterState& state) {
+	return state.builder.DecoratedType(
+	    spv::OpTypeRuntimeArray,
+	    {{spv::OpDecorate, {spv::DecorationArrayStride, sizeof(uint32_t)}}}, TypeU32(state));
+}
+
+uint32_t StorageBufferType(EmitterState& state) {
+	return state.builder.DecoratedType(spv::OpTypeStruct,
+	                                   {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+	                                    {spv::OpDecorate, {spv::DecorationBlock}}},
+	                                   StorageRuntimeArrayType(state));
+}
+
+uint32_t TypeStorageBufferPointer(EmitterState& state) {
+	return TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state));
+}
+
+uint32_t TypeStorageBufferElementPointer(EmitterState& state) {
+	return TypePointer(state, spv::StorageClassStorageBuffer, TypeU32(state));
+}
+
+uint32_t StorageU64RuntimeArrayType(EmitterState& state) {
+	return state.builder.DecoratedType(
+	    spv::OpTypeRuntimeArray,
+	    {{spv::OpDecorate, {spv::DecorationArrayStride, sizeof(uint64_t)}}}, TypeScalarU64(state));
+}
+
+uint32_t StorageBufferU64Type(EmitterState& state) {
+	return state.builder.DecoratedType(spv::OpTypeStruct,
+	                                   {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+	                                    {spv::OpDecorate, {spv::DecorationBlock}}},
+	                                   StorageU64RuntimeArrayType(state));
+}
+
+uint32_t TypeStorageBufferU64Pointer(EmitterState& state) {
+	return TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferU64Type(state));
+}
+
+uint32_t TypeStorageBufferU64ElementPointer(EmitterState& state) {
+	return TypePointer(state, spv::StorageClassStorageBuffer, TypeScalarU64(state));
+}
+
+uint32_t TypePhysicalU32Pointer(EmitterState& state) {
+	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeU32(state));
+}
+
+uint32_t TypePushConstantElementPointer(EmitterState& state) {
+	return TypePointer(state, spv::StorageClassPushConstant, TypeU32(state));
+}
+
+uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class,
+                             uint32_t dwords) {
+	const auto count = ConstantU32(state, std::max(dwords, 1u));
+	const auto array = state.builder.Type(spv::OpTypeArray, TypeU32(state), count);
+	return TypePointer(state, storage_class, array);
+}
+
+uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_class) {
+	return TypePointer(state, storage_class, TypeU32(state));
+}
+
+namespace {
+
+uint32_t PushConstantArrayType(EmitterState& state) {
+	const auto count = ConstantU32(state, IR::PushData::DwordCount);
+	return state.builder.DecoratedType(
+	    spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, sizeof(uint32_t)}}},
+	    TypeU32(state), count);
+}
+
+uint32_t PushConstantBlockType(EmitterState& state) {
+	return state.builder.DecoratedType(spv::OpTypeStruct,
+	                                   {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+	                                    {spv::OpDecorate, {spv::DecorationBlock}}},
+	                                   PushConstantArrayType(state));
+}
+
+uint32_t PerVertexType(EmitterState& state) {
+	return state.builder.DecoratedType(
+	    spv::OpTypeStruct,
+	    {{spv::OpMemberDecorate, {0, spv::DecorationBuiltIn, spv::BuiltInPosition}},
+	     {spv::OpDecorate, {spv::DecorationBlock}}},
+	    TypeF32Vector(state, 4));
+}
+
+uint32_t SampleMaskArrayType(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeArray, TypeI32(state), ConstantU32(state, 1));
+}
+
+uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
+	return state.builder.Type(spv::OpTypeArray, TypeF32(state), ConstantU32(state, count));
+}
+
+void DefineDescriptors(EmitterState& state) {
+	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh) {
+		const auto type              = PushConstantBlockType(state);
+		state.push_constant_variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
+		state.builder.AddName(type, "BufferResource");
+		state.builder.AddName(state.push_constant_variable, "vsharp");
+	}
+	for (const auto& binding: state.program.bindings.descriptors) {
+		const auto Define = [&](uint32_t type, const char* name,
+		                        spv::StorageClass storage = spv::StorageClassStorageBuffer) {
+			const auto variable =
+			    state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
+			state.builder.AddName(variable, name);
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0);
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding,
+			                            IR::NativeBinding(state.program.stage, binding.kind));
+			return variable;
+		};
+		const auto ArrayType = [&](uint32_t type) {
+			return state.builder.Type(
+			    spv::OpTypeArray, type,
+			    ConstantU32(state, static_cast<uint32_t>(binding.resources.size())));
+		};
+		switch (binding.kind) {
+			case IR::DescriptorBindingKind::Buffers:
+				state.storage_buffer_variable =
+				    Define(ArrayType(StorageBufferType(state)), "buffers");
+				if (state.requirements.buffer_int64_atomics) {
+					state.storage_buffer_u64_variable =
+					    Define(ArrayType(StorageBufferU64Type(state)), "buffers_u64");
+					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
+					                            spv::DecorationAliased);
+					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
+					                            spv::DecorationAliased);
+				}
+				break;
+			case IR::DescriptorBindingKind::BdaPagetable:
+				state.bda_pagetable_variable = Define(StorageBufferU64Type(state), "bda_pagetable");
+				break;
+			case IR::DescriptorBindingKind::FaultBuffer:
+				state.fault_buffer_variable = Define(StorageBufferType(state), "fault_buffer");
+				break;
+			case IR::DescriptorBindingKind::ShaderData:
+				state.shader_data_storage_variable =
+				    Define(StorageBufferType(state), "shader_data");
+				break;
+			case IR::DescriptorBindingKind::FlattenedSrt:
+				state.flattened_srt_variable = Define(StorageBufferType(state), "flattened_srt");
+				break;
+			case IR::DescriptorBindingKind::Samplers:
+				state.sampler_variable = Define(ArrayType(state.builder.Type(spv::OpTypeSampler)),
+				                                "samplers", spv::StorageClassUniformConstant);
+				break;
+			case IR::DescriptorBindingKind::Gds:
+				state.gds_variable = Define(StorageBufferType(state), "gds");
+				break;
+			default: {
+				EXIT_IF(IR::ImageBindingResourceClass(binding.kind) ==
+				        IR::ImageResourceClass::None);
+				const auto& image = state.program.info.images.at(binding.resources.front());
+				const auto  name  = "image_" + std::to_string(static_cast<uint32_t>(binding.kind));
+				state.image_variables[IR::ImageBindingIndex(binding.kind)] =
+				    Define(ArrayType(ImageType(state, image)), name.c_str(),
+				           spv::StorageClassUniformConstant);
+				if (image.dimension == ImageDimension::Dim1D ||
+				    image.dimension == ImageDimension::Dim1DArray) {
+					state.builder.RequireCapability(image.resource_class ==
+					                                        IR::ImageResourceClass::Sampled
+					                                    ? spv::CapabilitySampled1D
+					                                    : spv::CapabilityImage1D);
+				}
+				break;
+			}
+		}
+	}
+}
+
+} // namespace
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value) {
-	if (auto it = state.constants.find(value); it != state.constants.end()) {
-		return it->second;
-	}
-
-	const auto id = state.builder.AllocateId();
-	state.constants.emplace(value, id);
-	state.builder.AddType({OpConstant, state.uint_type, id, value});
-	return id;
+	return state.builder.Constant(spv::OpConstant, TypeU32(state), value);
 }
 
 uint32_t ConstantI32(EmitterState& state, int32_t value) {
-	const auto bits = static_cast<uint32_t>(value);
-	if (auto it = state.signed_constants.find(bits); it != state.signed_constants.end()) {
-		return it->second;
-	}
-
-	const auto id = state.builder.AllocateId();
-	state.signed_constants.emplace(bits, id);
-	state.builder.AddType({OpConstant, state.int_type, id, bits});
-	return id;
+	return state.builder.Constant(spv::OpConstant, TypeI32(state), static_cast<uint32_t>(value));
 }
 
 uint32_t ConstantF32(EmitterState& state, uint32_t bits) {
-	if (auto it = state.float_constants.find(bits); it != state.float_constants.end()) {
-		return it->second;
-	}
-
-	const auto id = state.builder.AllocateId();
-	state.float_constants.emplace(bits, id);
-	state.builder.AddType({OpConstant, state.float_type, id, bits});
-	return id;
-}
-
-uint32_t FloatBits(float value) {
-	uint32_t bits = 0;
-	std::memcpy(&bits, &value, sizeof(bits));
-	return bits;
+	return state.builder.Constant(spv::OpConstant, TypeF32(state), bits);
 }
 
 uint32_t ConstantF32Value(EmitterState& state, float value) {
-	return ConstantF32(state, FloatBits(value));
+	return ConstantF32(state, std::bit_cast<uint32_t>(value));
+}
+
+uint32_t ConstantBool(EmitterState& state, bool value) {
+	return state.builder.Constant(value ? spv::OpConstantTrue : spv::OpConstantFalse,
+	                              TypeBool(state));
+}
+
+uint32_t ConstantU64(EmitterState& state, uint64_t value) {
+	return state.builder.Constant(spv::OpConstantComposite, TypeU64(state),
+	                              ConstantU32(state, static_cast<uint32_t>(value)),
+	                              ConstantU32(state, static_cast<uint32_t>(value >> 32u)));
+}
+
+uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components) {
+	EXIT_IF(components < 2u || components > 4u);
+	const auto            zero = ConstantU32(state, 0);
+	std::vector<uint32_t> values(components, zero);
+	return state.builder.Constant(spv::OpConstantComposite, TypeU32Composite(state, components),
+	                              values);
+}
+
+uint32_t GlslStd450(EmitterState& state) {
+	return state.builder.Import("GLSL.std.450");
 }
 
 VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint32_t location) {
-	if (state.stage != ShaderType::Vertex || location >= ShaderVertexInputInfo::RES_MAX ||
+	if ((state.program.stage != ShaderType::Vertex && state.program.stage != ShaderType::Local) ||
+	    location >= ShaderVertexInputInfo::RES_MAX ||
 	    location >= static_cast<uint32_t>(state.input_info.vertex->resources_num)) {
 		return VertexInputScalarKind::Float;
 	}
@@ -89,767 +316,399 @@ VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint3
 	}
 }
 
-uint32_t VertexParameterComponentCount(const EmitterState& state, const InputBinding& input) {
-	uint32_t count = input.component_count;
-	if (state.stage == ShaderType::Vertex && input.location < ShaderVertexInputInfo::RES_MAX &&
-	    input.location < static_cast<uint32_t>(state.input_info.vertex->resources_num) &&
-	    state.input_info.vertex->resources_dst[input.location].registers_num > 0) {
-		count = static_cast<uint32_t>(
-		    state.input_info.vertex->resources_dst[input.location].registers_num);
-	}
-	return std::clamp(count, 1u, 4u);
+uint32_t VertexParameterComponentCount(const InputBinding& input) {
+	return std::clamp(input.component_count, 1u, 4u);
 }
 
-uint32_t VertexParameterScalarType(const EmitterState& state, VertexInputScalarKind kind) {
+uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind) {
 	switch (kind) {
-		case VertexInputScalarKind::Sint: return state.int_type;
-		case VertexInputScalarKind::Uint: return state.uint_type;
+		case VertexInputScalarKind::Sint: return TypeI32(state);
+		case VertexInputScalarKind::Uint: return TypeU32(state);
 		case VertexInputScalarKind::Float:
-		default: return state.float_type;
+		default: return TypeF32(state);
 	}
 }
 
-uint32_t VertexParameterScalarPointerType(const EmitterState& state, VertexInputScalarKind kind) {
-	switch (kind) {
-		case VertexInputScalarKind::Sint: return state.ptr_input_int;
-		case VertexInputScalarKind::Uint: return state.ptr_input_uint;
-		case VertexInputScalarKind::Float:
-		default: return state.ptr_input_float;
-	}
-}
-
-uint32_t VertexParameterVectorOrScalarType(const EmitterState& state, VertexInputScalarKind kind,
-                                           uint32_t components) {
-	switch (kind) {
-		case VertexInputScalarKind::Sint:
-			switch (components) {
-				case 1: return state.int_type;
-				case 2: return state.vec2_int_type;
-				case 3: return state.vec3_int_type;
-				default: return state.vec4_int_type;
-			}
-		case VertexInputScalarKind::Uint:
-			switch (components) {
-				case 1: return state.uint_type;
-				case 2: return state.vec2_uint_type;
-				case 3: return state.vec3_uint_type;
-				default: return state.vec4_uint_type;
-			}
-		case VertexInputScalarKind::Float:
-		default:
-			switch (components) {
-				case 1: return state.float_type;
-				case 2: return state.vec2_float_type;
-				case 3: return state.vec3_float_type;
-				default: return state.vec4_float_type;
-			}
-	}
-}
-
-uint32_t VertexParameterInputPointerType(const EmitterState& state, VertexInputScalarKind kind,
-                                         uint32_t components) {
-	switch (kind) {
-		case VertexInputScalarKind::Sint:
-			switch (components) {
-				case 1: return state.ptr_input_int;
-				case 2: return state.ptr_input_vec2_int;
-				case 3: return state.ptr_input_vec3_int;
-				default: return state.ptr_input_vec4_int;
-			}
-		case VertexInputScalarKind::Uint:
-			switch (components) {
-				case 1: return state.ptr_input_uint;
-				case 2: return state.ptr_input_vec2_uint;
-				case 3: return state.ptr_input_vec3_uint;
-				default: return state.ptr_input_vec4_uint;
-			}
-		case VertexInputScalarKind::Float:
-		default:
-			switch (components) {
-				case 1: return state.ptr_input_float;
-				case 2: return state.ptr_input_vec2_float;
-				case 3: return state.ptr_input_vec3_float;
-				default: return state.ptr_input_vec4_float;
-			}
-	}
-}
-
-static bool MrtUsesUintOutput(const EmitterState& state, uint32_t index) {
-	return state.stage == ShaderType::Pixel &&
-	       index < std::size(state.input_info.pixel->target_output_mode) &&
-	       state.input_info.pixel->target_output_mode[index] == 7u;
-}
-
-void AllocateInputVariables(EmitterState& state) {
-	for (auto& binding: state.inputs) {
-		binding.variable_id = state.builder.AllocateId();
-		state.interface_variables.push_back(binding.variable_id);
-	}
-	if (state.needs_subgroup_local_invocation_id) {
-		state.subgroup_local_invocation_id_variable = state.builder.AllocateId();
-		state.interface_variables.push_back(state.subgroup_local_invocation_id_variable);
-	}
-}
-
-static uint32_t AllocateInterfaceVariable(EmitterState& state) {
-	const auto variable = state.builder.AllocateId();
+uint32_t DefineInterfaceVariable(EmitterState& state, uint32_t type, spv::StorageClass storage,
+                                 const char* name) {
+	const auto variable =
+	    state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
 	state.interface_variables.push_back(variable);
+	state.builder.AddName(variable, name);
 	return variable;
 }
 
-static uint32_t AllocateSharedOutputVariable(EmitterState& state, uint32_t& variable) {
-	if (variable == 0) {
-		variable = AllocateInterfaceVariable(state);
-	}
-	return variable;
-}
-
-void AllocateOutputVariables(EmitterState& state) {
-	for (auto& binding: state.outputs) {
-		switch (binding.kind) {
-			case IR::StageOutputKind::Position:
-				binding.variable_id =
-				    AllocateSharedOutputVariable(state, state.per_vertex_variable);
-				break;
-			case IR::StageOutputKind::Depth:
-				binding.variable_id = AllocateSharedOutputVariable(state, state.depth_variable);
-				break;
-			case IR::StageOutputKind::SampleMask:
-				binding.variable_id =
-				    AllocateSharedOutputVariable(state, state.sample_mask_variable);
-				break;
-			case IR::StageOutputKind::Parameter:
-			case IR::StageOutputKind::Mrt:
-				binding.variable_id = AllocateInterfaceVariable(state);
-				break;
-		}
-	}
-}
+namespace {
 
 uint32_t BuiltInForInput(IR::StageInputKind kind) {
 	switch (kind) {
-		case IR::StageInputKind::VertexIndex: return BuiltInVertexIndex;
-		case IR::StageInputKind::InstanceIndex: return BuiltInInstanceIndex;
-		case IR::StageInputKind::FragCoord: return BuiltInFragCoord;
-		case IR::StageInputKind::FrontFacing: return BuiltInFrontFacing;
-		case IR::StageInputKind::WorkgroupId: return BuiltInWorkgroupId;
-		case IR::StageInputKind::LocalInvocationId: return BuiltInLocalInvocationId;
-		case IR::StageInputKind::LocalInvocationIndex: return BuiltInLocalInvocationIndex;
-		case IR::StageInputKind::GlobalInvocationId: return BuiltInGlobalInvocationId;
+		case IR::StageInputKind::VertexIndex: return spv::BuiltInVertexIndex;
+		case IR::StageInputKind::InvocationId: return spv::BuiltInInvocationId;
+		case IR::StageInputKind::PrimitiveId: return spv::BuiltInPrimitiveId;
+		case IR::StageInputKind::TessCoord: return spv::BuiltInTessCoord;
+		case IR::StageInputKind::InstanceIndex: return spv::BuiltInInstanceIndex;
+		case IR::StageInputKind::FragCoord: return spv::BuiltInFragCoord;
+		case IR::StageInputKind::FrontFacing: return spv::BuiltInFrontFacing;
+		case IR::StageInputKind::Layer: return spv::BuiltInLayer;
+		case IR::StageInputKind::SampleId: return spv::BuiltInSampleId;
+		case IR::StageInputKind::BaryCoordSmooth: return spv::BuiltInBaryCoordKHR;
+		case IR::StageInputKind::BaryCoordNoPerspective: return spv::BuiltInBaryCoordNoPerspKHR;
+		case IR::StageInputKind::WorkgroupId: return spv::BuiltInWorkgroupId;
+		case IR::StageInputKind::LocalInvocationId: return spv::BuiltInLocalInvocationId;
+		case IR::StageInputKind::LocalInvocationIndex: return spv::BuiltInLocalInvocationIndex;
+		case IR::StageInputKind::GlobalInvocationId: return spv::BuiltInGlobalInvocationId;
 		default: return UINT32_MAX;
 	}
 }
 
-void AddInputAnnotationsAndNames(EmitterState& state) {
-	if (state.subgroup_local_invocation_id_variable != 0) {
-		state.builder.AddName(state.subgroup_local_invocation_id_variable,
-		                      "gl_SubgroupInvocationID");
-		state.builder.AddAnnotation({OpDecorate, state.subgroup_local_invocation_id_variable,
-		                             DecorationBuiltIn, BuiltInSubgroupLocalInvocationId});
-		if (state.stage == ShaderType::Pixel) {
-			state.builder.AddAnnotation(
-			    {OpDecorate, state.subgroup_local_invocation_id_variable, DecorationFlat});
+void DefineInputs(EmitterState& state) {
+	state.inputs.reserve(state.program.info.inputs.size());
+	for (const auto& input: state.program.info.inputs) {
+		state.inputs.push_back({input});
+	}
+	if (state.lane_count == 2) {
+		const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
+		                             const char* name) {
+			if (std::ranges::none_of(state.inputs, [kind](const InputBinding& input) {
+				    return input.kind == kind;
+			    })) {
+				state.inputs.push_back({{kind, 0, components, name}});
+			}
+		};
+		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
+		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
+			    return input.kind == IR::StageInputKind::GlobalInvocationId;
+		    })) {
+			add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		}
 	}
-	for (const auto& input: state.inputs) {
-		state.builder.AddName(input.variable_id, input.debug_name.c_str());
-		if (input.kind == IR::StageInputKind::Parameter) {
-			const auto flat = PixelParameterIsFlat(state, input.location);
-			if (flat) {
-				state.builder.AddAnnotation({OpDecorate, input.variable_id, DecorationFlat});
-			}
-			if (state.stage == ShaderType::Pixel && state.input_info.pixel->ps_no_perspective &&
-			    !flat) {
-				state.builder.AddAnnotation(
-				    {OpDecorate, input.variable_id, DecorationNoPerspective});
-			}
+	for (auto& input: state.inputs) {
+		if (state.program.stage == ShaderType::Pixel &&
+		    input.kind == IR::StageInputKind::Parameter) {
 			const auto location = PixelParameterLocation(state, input.location);
-			state.builder.AddAnnotation(
-			    {OpDecorate, input.variable_id, DecorationLocation, location});
-			continue;
+			const auto alias = std::ranges::find_if(state.inputs, [&](const InputBinding& other) {
+				return other.kind == IR::StageInputKind::Parameter && other.variable_id != 0 &&
+				       PixelParameterLocation(state, other.location) == location;
+			});
+			if (alias != state.inputs.end()) {
+				EXIT_IF(alias->per_vertex != input.per_vertex);
+				input.variable_id = alias->variable_id;
+				continue;
+			}
 		}
-		const auto builtin = BuiltInForInput(input.kind);
-		if (builtin != UINT32_MAX) {
-			state.builder.AddAnnotation(
-			    {OpDecorate, input.variable_id, DecorationBuiltIn, builtin});
-		}
-	}
-}
-
-void AddOutputAnnotationsAndNames(EmitterState& state) {
-	if (state.per_vertex_variable != 0) {
-		state.builder.AddName(state.per_vertex_type, "gl_PerVertex");
-		state.builder.AddName(state.per_vertex_variable, "outPerVertex");
-		state.builder.AddAnnotation(
-		    {OpMemberDecorate, state.per_vertex_type, 0, DecorationBuiltIn, BuiltInPosition});
-		state.builder.AddAnnotation({OpDecorate, state.per_vertex_type, DecorationBlock});
-	}
-	if (state.depth_variable != 0) {
-		state.builder.AddName(state.depth_variable, "gl_FragDepth");
-		state.builder.AddAnnotation(
-		    {OpDecorate, state.depth_variable, DecorationBuiltIn, BuiltInFragDepth});
-	}
-	if (state.sample_mask_variable != 0) {
-		state.builder.AddName(state.sample_mask_variable, "gl_SampleMask");
-		state.builder.AddAnnotation(
-		    {OpDecorate, state.sample_mask_variable, DecorationBuiltIn, BuiltInSampleMask});
-	}
-	for (const auto& binding: state.outputs) {
-		if (binding.kind == IR::StageOutputKind::Parameter ||
-		    binding.kind == IR::StageOutputKind::Mrt) {
-			state.builder.AddName(binding.variable_id, binding.debug_name.c_str());
-			state.builder.AddAnnotation(
-			    {OpDecorate, binding.variable_id, DecorationLocation, binding.location});
-		}
-	}
-}
-
-void DecorateDescriptor(EmitterState& state, uint32_t variable, const char* name, uint32_t set,
-                        uint32_t binding) {
-	if (variable == 0) {
-		return;
-	}
-	state.builder.AddName(variable, name);
-	state.builder.AddAnnotation({OpDecorate, variable, DecorationDescriptorSet, set});
-	state.builder.AddAnnotation({OpDecorate, variable, DecorationBinding, binding});
-}
-
-void AddDescriptorAnnotationsAndNames(EmitterState& state) {
-	const auto set      = state.program.bindings.descriptor_set;
-	auto       Decorate = [&](uint32_t variable, const char* name, IR::DescriptorBindingKind kind) {
-		const auto* binding = DescriptorBinding(state, kind);
-		if (binding != nullptr) {
-			DecorateDescriptor(state, variable, name, set, binding->binding);
-		}
-	};
-	if (state.storage_buffer_variable != 0) {
-		Decorate(state.storage_buffer_variable, "buffers", IR::DescriptorBindingKind::Buffers);
-	}
-	if (state.address_memory_variable != 0) {
-		Decorate(state.address_memory_variable, "address_memory",
-		         IR::DescriptorBindingKind::AddressMemory);
-	}
-	constexpr const char* SampledNames[] = {"sampled_1d",
-	                                        "sampled_1d_array",
-	                                        "sampled_2d",
-	                                        "sampled_2d_array",
-	                                        "sampled_3d",
-	                                        "sampled_2d_msaa",
-	                                        "sampled_2d_msaa_array",
-	                                        "sampled_uint_1d",
-	                                        "sampled_uint_1d_array",
-	                                        "sampled_uint_2d",
-	                                        "sampled_uint_2d_array",
-	                                        "sampled_uint_3d",
-	                                        "sampled_uint_2d_msaa",
-	                                        "sampled_uint_2d_msaa_array"};
-	for (uint32_t i = 0; i < state.sampled_images.size(); i++) {
-		const auto view = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
-		Decorate(state.sampled_images[i].variable, SampledNames[i],
-		         SampledBindingKind(i >= SampledImageViewKindCount, view));
-	}
-	constexpr const char* StorageNames[] = {"storage_1d",
-	                                        "storage_1d_array",
-	                                        "storage_2d",
-	                                        "storage_2d_array",
-	                                        "storage_3d",
-	                                        "storage_uint_1d",
-	                                        "storage_uint_1d_array",
-	                                        "storage_uint_2d",
-	                                        "storage_uint_2d_array",
-	                                        "storage_uint_3d"};
-	for (uint32_t i = 0; i < state.storage_images.size(); i++) {
-		const auto view = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
-		Decorate(state.storage_images[i].variable, StorageNames[i],
-		         StorageBindingKind(i >= StorageImageViewKindCount, view));
-	}
-	if (state.sampler_variable != 0) {
-		Decorate(state.sampler_variable, "samplers", IR::DescriptorBindingKind::Samplers);
-	}
-	if (state.gds_variable != 0) {
-		Decorate(state.gds_variable, "gds", IR::DescriptorBindingKind::Gds);
-	}
-	if (state.flattened_srt_variable != 0) {
-		Decorate(state.flattened_srt_variable, "flattened_srt",
-		         IR::DescriptorBindingKind::FlattenedSrt);
-	}
-}
-
-void AddVsharpAnnotationsAndNames(EmitterState& state) {
-	const auto& bind = state.program.bindings;
-	if (state.push_constant_variable != 0) {
-		state.builder.AddName(state.push_constant_block_type, "BufferResource");
-		state.builder.AddName(state.push_constant_variable, "vsharp");
-		state.builder.AddAnnotation(
-		    {OpDecorate, state.push_constant_array_type, DecorationArrayStride, 4});
-		state.builder.AddAnnotation({OpMemberDecorate, state.push_constant_block_type, 0,
-		                             DecorationOffset, bind.push_constant_offset});
-		state.builder.AddAnnotation({OpDecorate, state.push_constant_block_type, DecorationBlock});
-	}
-	if (state.vsharp_storage_variable != 0) {
-		const auto* storage = DescriptorBinding(state, IR::DescriptorBindingKind::UserData);
-		if (storage != nullptr) {
-			DecorateDescriptor(state, state.vsharp_storage_variable, "user_data",
-			                   bind.descriptor_set, storage->binding);
-		}
-	}
-}
-
-void EmitHeaderAndTypes(EmitterState& state) {
-	state.void_type                    = state.builder.AllocateId();
-	state.bool_type                    = state.builder.AllocateId();
-	state.uint_type                    = state.builder.AllocateId();
-	state.uint_pair_type               = state.builder.AllocateId();
-	state.int_type                     = state.builder.AllocateId();
-	state.int_pair_type                = state.builder.AllocateId();
-	state.float_type                   = state.builder.AllocateId();
-	state.vec2_uint_type               = state.builder.AllocateId();
-	state.vec3_uint_type               = state.builder.AllocateId();
-	state.vec4_uint_type               = state.builder.AllocateId();
-	state.vec2_int_type                = state.builder.AllocateId();
-	state.vec3_int_type                = state.builder.AllocateId();
-	state.vec4_int_type                = state.builder.AllocateId();
-	state.vec2_float_type              = state.builder.AllocateId();
-	state.vec3_float_type              = state.builder.AllocateId();
-	state.vec4_float_type              = state.builder.AllocateId();
-	state.ptr_func_uint                = state.builder.AllocateId();
-	state.ptr_func_bool                = state.builder.AllocateId();
-	state.ptr_func_float               = state.builder.AllocateId();
-	state.ptr_func_uint_pair           = state.builder.AllocateId();
-	state.ptr_func_vec4_uint           = state.builder.AllocateId();
-	state.ptr_func_vec2_float          = state.builder.AllocateId();
-	state.ptr_input_float              = state.builder.AllocateId();
-	state.ptr_input_bool               = state.builder.AllocateId();
-	state.ptr_input_int                = state.builder.AllocateId();
-	state.ptr_input_uint               = state.builder.AllocateId();
-	state.ptr_input_vec2_float         = state.builder.AllocateId();
-	state.ptr_input_vec3_float         = state.builder.AllocateId();
-	state.ptr_input_vec2_int           = state.builder.AllocateId();
-	state.ptr_input_vec3_int           = state.builder.AllocateId();
-	state.ptr_input_vec4_int           = state.builder.AllocateId();
-	state.ptr_input_vec2_uint          = state.builder.AllocateId();
-	state.ptr_input_vec3_uint          = state.builder.AllocateId();
-	state.ptr_input_vec4_uint          = state.builder.AllocateId();
-	state.ptr_input_vec4_float         = state.builder.AllocateId();
-	state.sample_mask_array_type       = state.builder.AllocateId();
-	state.ptr_output_int               = state.builder.AllocateId();
-	state.ptr_output_sample_mask_array = state.builder.AllocateId();
-	state.ptr_output_float             = state.builder.AllocateId();
-	state.ptr_output_vec4_float        = state.builder.AllocateId();
-	const auto ptr_output_vec4_uint    = state.builder.AllocateId();
-	state.per_vertex_type              = state.builder.AllocateId();
-	state.ptr_output_per_vertex        = state.builder.AllocateId();
-	state.storage_runtime_array_type   = state.builder.AllocateId();
-	state.storage_buffer_type          = state.builder.AllocateId();
-	state.ptr_storage_buffer           = state.builder.AllocateId();
-	state.ptr_storage_buffer_uint      = state.builder.AllocateId();
-	state.storage_buffer_array_type    = state.builder.AllocateId();
-	state.ptr_storage_buffer_array     = state.builder.AllocateId();
-	if (state.address_memory_variable != 0) {
-		state.address_memory_array_type = state.builder.AllocateId();
-		state.ptr_address_memory_array  = state.builder.AllocateId();
-	}
-	if (state.push_constant_variable != 0) {
-		state.push_constant_array_type = state.builder.AllocateId();
-		state.push_constant_block_type = state.builder.AllocateId();
-		state.ptr_push_constant_block  = state.builder.AllocateId();
-		state.ptr_push_constant_uint   = state.builder.AllocateId();
-	}
-	state.lds_array_type      = state.builder.AllocateId();
-	state.ptr_workgroup_array = state.builder.AllocateId();
-	state.ptr_workgroup_uint  = state.builder.AllocateId();
-	state.lds_variable        = state.builder.AllocateId();
-	for (auto& image: state.sampled_images) {
-		image.image_type         = state.builder.AllocateId();
-		image.sampled_image_type = state.builder.AllocateId();
-		image.pointer_type       = state.builder.AllocateId();
-		image.array_type         = state.builder.AllocateId();
-		image.array_pointer_type = state.builder.AllocateId();
-	}
-	for (auto& image: state.storage_images) {
-		image.image_type         = state.builder.AllocateId();
-		image.pointer_type       = state.builder.AllocateId();
-		image.array_type         = state.builder.AllocateId();
-		image.array_pointer_type = state.builder.AllocateId();
-	}
-	state.sampler_type              = state.builder.AllocateId();
-	state.sampler_array_type        = state.builder.AllocateId();
-	state.ptr_uniform_sampler       = state.builder.AllocateId();
-	state.ptr_uniform_sampler_array = state.builder.AllocateId();
-	state.ptr_image_uint            = state.builder.AllocateId();
-	state.func_type                 = state.builder.AllocateId();
-	state.main_func                 = state.builder.AllocateId();
-	state.entry_label               = state.builder.AllocateId();
-	state.glsl_std450               = state.builder.AllocateId();
-
-	state.builder.AddCapability({CapabilityShader});
-	state.builder.AddCapability({CapabilitySampled1D});
-	state.builder.AddCapability({CapabilityImage1D});
-	state.builder.AddCapability({CapabilityImageQuery});
-	state.builder.AddCapability({CapabilitySignedZeroInfNanPreserve});
-	if (state.needs_image_gather_extended) {
-		state.builder.AddCapability({CapabilityImageGatherExtended});
-	}
-	if (std::any_of(state.storage_images.begin(),
-	                state.storage_images.begin() + StorageImageViewKindCount,
-	                [](const auto& image) { return image.variable != 0; })) {
-		state.builder.AddCapability({CapabilityStorageImageReadWithoutFormat});
-		state.builder.AddCapability({CapabilityStorageImageWriteWithoutFormat});
-	}
-	if (state.needs_subgroup_ballot || state.needs_subgroup_shuffle ||
-	    state.needs_subgroup_local_invocation_id) {
-		state.builder.AddCapability({CapabilityGroupNonUniform});
-	}
-	if (state.needs_subgroup_ballot) {
-		state.builder.AddCapability({CapabilityGroupNonUniformBallot});
-	}
-	if (state.needs_subgroup_shuffle) {
-		state.builder.AddCapability({CapabilityGroupNonUniformShuffle});
-	}
-	if (state.needs_compute_derivatives && state.stage == ShaderType::Compute) {
-		state.builder.AddCapability({CapabilityComputeDerivativeGroupQuadsKHR});
-		state.builder.AddExtension("SPV_KHR_compute_shader_derivatives");
-	}
-	state.builder.AddExtension("SPV_KHR_float_controls");
-	state.builder.AddExtInstImport(state.glsl_std450, "GLSL.std.450");
-	state.builder.AddMemoryModel({AddressingModelLogical, MemoryModelGLSL450});
-	state.builder.AddEntryPoint(ExecutionModelForStage(state.stage), state.main_func, "main",
-	                            state.interface_variables);
-	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
-	// contract prevents host compilers from treating synthesized IEEE values as finite.
-	state.builder.AddExecutionMode({state.main_func, ExecutionModeSignedZeroInfNanPreserve, 32u});
-	if (state.stage == ShaderType::Compute) {
-		uint32_t    local_x = state.needs_compute_derivatives ? 2u : 1u;
-		uint32_t    local_y = state.needs_compute_derivatives ? 2u : 1u;
-		uint32_t    local_z = 1u;
-		const auto* cs      = state.input_info.compute;
-		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
-		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
-		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
-		state.builder.AddExecutionMode(
-		    {state.main_func, ExecutionModeLocalSize, local_x, local_y, local_z});
-	}
-	if (state.stage == ShaderType::Pixel) {
-		state.builder.AddExecutionMode({state.main_func, ExecutionModeOriginUpperLeft});
-		if (state.depth_variable != 0) {
-			state.builder.AddExecutionMode({state.main_func, ExecutionModeDepthReplacing});
-		}
-		if (state.input_info.pixel->ps_early_z && !state.input_info.pixel->ps_pixel_kill_enable &&
-		    !state.input_info.pixel->ps_depth_export_enable &&
-		    !state.input_info.pixel->ps_sample_mask_export_enable) {
-			state.builder.AddExecutionMode({state.main_func, ExecutionModeEarlyFragmentTests});
-		}
-	}
-	if (state.needs_compute_derivatives && state.stage == ShaderType::Compute) {
-		state.builder.AddExecutionMode({state.main_func, ExecutionModeDerivativeGroupQuadsKHR});
-	}
-	state.builder.AddName(state.main_func, "main");
-	if (state.stage == ShaderType::Compute || state.needs_function_lds) {
-		state.builder.AddName(state.lds_variable, "lds_dwords");
-	}
-	AddInputAnnotationsAndNames(state);
-	AddOutputAnnotationsAndNames(state);
-	AddDescriptorAnnotationsAndNames(state);
-	AddVsharpAnnotationsAndNames(state);
-	state.builder.AddAnnotation(
-	    {OpDecorate, state.storage_runtime_array_type, DecorationArrayStride, 4});
-	state.builder.AddAnnotation(
-	    {OpMemberDecorate, state.storage_buffer_type, 0, DecorationOffset, 0});
-	state.builder.AddAnnotation({OpDecorate, state.storage_buffer_type, DecorationBlock});
-
-	state.builder.AddType({OpTypeVoid, state.void_type});
-	state.builder.AddType({OpTypeBool, state.bool_type});
-	state.builder.AddType({OpTypeInt, state.uint_type, 32, 0});
-	state.builder.AddType({OpTypeStruct, state.uint_pair_type, state.uint_type, state.uint_type});
-	state.builder.AddType({OpTypeInt, state.int_type, 32, 1});
-	state.builder.AddType({OpTypeStruct, state.int_pair_type, state.int_type, state.int_type});
-	state.builder.AddType({OpTypeFloat, state.float_type, 32});
-	state.builder.AddType({OpTypeVector, state.vec2_uint_type, state.uint_type, 2});
-	state.builder.AddType({OpTypeVector, state.vec3_uint_type, state.uint_type, 3});
-	state.builder.AddType({OpTypeVector, state.vec4_uint_type, state.uint_type, 4});
-	state.builder.AddType({OpTypeVector, state.vec2_int_type, state.int_type, 2});
-	state.builder.AddType({OpTypeVector, state.vec3_int_type, state.int_type, 3});
-	state.builder.AddType({OpTypeVector, state.vec4_int_type, state.int_type, 4});
-	state.builder.AddType({OpTypeVector, state.vec2_float_type, state.float_type, 2});
-	state.builder.AddType({OpTypeVector, state.vec3_float_type, state.float_type, 3});
-	state.builder.AddType({OpTypeVector, state.vec4_float_type, state.float_type, 4});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_func_uint, StorageClassFunction, state.uint_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_func_bool, StorageClassFunction, state.bool_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_func_float, StorageClassFunction, state.float_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_func_uint_pair, StorageClassFunction, state.uint_pair_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_func_vec4_uint, StorageClassFunction, state.vec4_uint_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_func_vec2_float, StorageClassFunction, state.vec2_float_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_input_float, StorageClassInput, state.float_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_input_bool, StorageClassInput, state.bool_type});
-	state.builder.AddType({OpTypePointer, state.ptr_input_int, StorageClassInput, state.int_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_input_uint, StorageClassInput, state.uint_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_input_vec2_float, StorageClassInput, state.vec2_float_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_input_vec3_float, StorageClassInput, state.vec3_float_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_input_vec2_int, StorageClassInput, state.vec2_int_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_input_vec3_int, StorageClassInput, state.vec3_int_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_input_vec4_int, StorageClassInput, state.vec4_int_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_input_vec2_uint, StorageClassInput, state.vec2_uint_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_input_vec3_uint, StorageClassInput, state.vec3_uint_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_input_vec4_uint, StorageClassInput, state.vec4_uint_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_input_vec4_float, StorageClassInput, state.vec4_float_type});
-	if (state.subgroup_local_invocation_id_variable != 0) {
-		state.builder.AddType({OpVariable, state.ptr_input_uint,
-		                       state.subgroup_local_invocation_id_variable, StorageClassInput});
-	}
-	for (const auto& input: state.inputs) {
-		uint32_t ptr_type = state.ptr_input_uint;
+		uint32_t type = TypeU32(state);
 		switch (input.kind) {
 			case IR::StageInputKind::VertexIndex:
-			case IR::StageInputKind::InstanceIndex: ptr_type = state.ptr_input_int; break;
+			case IR::StageInputKind::InvocationId:
+			case IR::StageInputKind::PrimitiveId:
+			case IR::StageInputKind::InstanceIndex:
+			case IR::StageInputKind::Layer:
+			case IR::StageInputKind::SampleId: type = TypeI32(state); break;
 			case IR::StageInputKind::WorkgroupId:
 			case IR::StageInputKind::LocalInvocationId:
-			case IR::StageInputKind::GlobalInvocationId:
-				ptr_type = state.ptr_input_vec3_uint;
-				break;
-			case IR::StageInputKind::FragCoord: ptr_type = state.ptr_input_vec4_float; break;
-			case IR::StageInputKind::FrontFacing: ptr_type = state.ptr_input_bool; break;
+			case IR::StageInputKind::GlobalInvocationId: type = TypeU32Vector(state, 3); break;
+			case IR::StageInputKind::FragCoord: type = TypeF32Vector(state, 4); break;
+			case IR::StageInputKind::TessCoord:
+			case IR::StageInputKind::BaryCoordSmooth:
+			case IR::StageInputKind::BaryCoordNoPerspective: type = TypeF32Vector(state, 3); break;
+			case IR::StageInputKind::FrontFacing: type = TypeBool(state); break;
 			case IR::StageInputKind::Parameter:
-				if (state.stage == ShaderType::Vertex) {
-					const auto kind       = VertexParameterScalarKind(state, input.location);
-					const auto components = VertexParameterComponentCount(state, input);
-					ptr_type = VertexParameterInputPointerType(state, kind, components);
+				if (state.program.stage == ShaderType::Vertex ||
+				    state.program.stage == ShaderType::Local) {
+					type = VertexParameterScalarType(
+					    state, VertexParameterScalarKind(state, input.location));
+					const auto components = VertexParameterComponentCount(input);
+					if (components > 1u) {
+						type = state.builder.Type(spv::OpTypeVector, type, components);
+					}
+				} else if (input.per_vertex) {
+					type = state.builder.Type(spv::OpTypeArray, TypeF32Vector(state, 4),
+					                          ConstantU32(state, 3));
 				} else {
-					ptr_type = state.ptr_input_vec4_float;
+					type = TypeF32Vector(state, 4);
 				}
 				break;
 			default: break;
 		}
-		state.builder.AddType({OpVariable, ptr_type, input.variable_id, StorageClassInput});
-	}
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_output_float, StorageClassOutput, state.float_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_output_int, StorageClassOutput, state.int_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_output_vec4_float, StorageClassOutput, state.vec4_float_type});
-	state.builder.AddType(
-	    {OpTypePointer, ptr_output_vec4_uint, StorageClassOutput, state.vec4_uint_type});
-	if (state.per_vertex_variable != 0) {
-		state.builder.AddType({OpTypeStruct, state.per_vertex_type, state.vec4_float_type});
-		state.builder.AddType({OpTypePointer, state.ptr_output_per_vertex, StorageClassOutput,
-		                       state.per_vertex_type});
-		state.builder.AddType({OpVariable, state.ptr_output_per_vertex, state.per_vertex_variable,
-		                       StorageClassOutput});
-	}
-	for (const auto& binding: state.outputs) {
-		if (binding.kind == IR::StageOutputKind::Parameter ||
-		    binding.kind == IR::StageOutputKind::Mrt) {
-			const auto pointer_type =
-			    binding.kind == IR::StageOutputKind::Mrt && MrtUsesUintOutput(state, binding.index)
-			        ? ptr_output_vec4_uint
-			        : state.ptr_output_vec4_float;
-			state.builder.AddType(
-			    {OpVariable, pointer_type, binding.variable_id, StorageClassOutput});
+		input.variable_id =
+		    DefineInterfaceVariable(state, type, spv::StorageClassInput, input.debug_name.c_str());
+		if (input.kind == IR::StageInputKind::Layer || input.kind == IR::StageInputKind::SampleId) {
+			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationFlat);
+		}
+		if (input.kind == IR::StageInputKind::Parameter) {
+			const auto flat = PixelParameterIsFlat(state, input.location);
+			if (input.per_vertex) {
+				state.builder.AddAnnotation(spv::OpDecorate, input.variable_id,
+				                            spv::DecorationPerVertexKHR);
+			} else if (flat) {
+				state.builder.AddAnnotation(spv::OpDecorate, input.variable_id,
+				                            spv::DecorationFlat);
+			}
+			if (state.program.stage == ShaderType::Pixel &&
+			    state.input_info.pixel->ps_no_perspective && !flat && !input.per_vertex) {
+				state.builder.AddAnnotation(spv::OpDecorate, input.variable_id,
+				                            spv::DecorationNoPerspective);
+			}
+			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationLocation,
+			                            PixelParameterLocation(state, input.location));
+		} else if (const auto builtin = BuiltInForInput(input.kind); builtin != UINT32_MAX) {
+			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationBuiltIn,
+			                            builtin);
 		}
 	}
-	if (state.depth_variable != 0) {
-		state.builder.AddType(
-		    {OpVariable, state.ptr_output_float, state.depth_variable, StorageClassOutput});
-	}
-	if (state.sample_mask_variable != 0) {
-		state.builder.AddType(
-		    {OpTypeArray, state.sample_mask_array_type, state.int_type, ConstantU32(state, 1)});
-		state.builder.AddType({OpTypePointer, state.ptr_output_sample_mask_array,
-		                       StorageClassOutput, state.sample_mask_array_type});
-		state.builder.AddType({OpVariable, state.ptr_output_sample_mask_array,
-		                       state.sample_mask_variable, StorageClassOutput});
-	}
-	state.builder.AddType({OpTypeRuntimeArray, state.storage_runtime_array_type, state.uint_type});
-	state.builder.AddType(
-	    {OpTypeStruct, state.storage_buffer_type, state.storage_runtime_array_type});
-	state.builder.AddType({OpTypePointer, state.ptr_storage_buffer, StorageClassStorageBuffer,
-	                       state.storage_buffer_type});
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_storage_buffer_uint, StorageClassStorageBuffer, state.uint_type});
-	if (state.storage_buffer_variable != 0) {
-		const auto count =
-		    ConstantU32(state, DescriptorCount(state, IR::DescriptorBindingKind::Buffers));
-		state.builder.AddType(
-		    {OpTypeArray, state.storage_buffer_array_type, state.storage_buffer_type, count});
-		state.builder.AddType({OpTypePointer, state.ptr_storage_buffer_array,
-		                       StorageClassStorageBuffer, state.storage_buffer_array_type});
-		state.builder.AddType({OpVariable, state.ptr_storage_buffer_array,
-		                       state.storage_buffer_variable, StorageClassStorageBuffer});
-	}
-	if (state.gds_variable != 0) {
-		state.builder.AddType(
-		    {OpVariable, state.ptr_storage_buffer, state.gds_variable, StorageClassStorageBuffer});
-	}
-	if (state.push_constant_variable != 0) {
-		const auto dword_count =
-		    ConstantU32(state, state.program.bindings.push_constant_size / sizeof(uint32_t));
-		state.builder.AddType(
-		    {OpTypeArray, state.push_constant_array_type, state.uint_type, dword_count});
-		state.builder.AddType(
-		    {OpTypeStruct, state.push_constant_block_type, state.push_constant_array_type});
-		state.builder.AddType({OpTypePointer, state.ptr_push_constant_block,
-		                       StorageClassPushConstant, state.push_constant_block_type});
-		state.builder.AddType({OpTypePointer, state.ptr_push_constant_uint,
-		                       StorageClassPushConstant, state.uint_type});
-		state.builder.AddType({OpVariable, state.ptr_push_constant_block,
-		                       state.push_constant_variable, StorageClassPushConstant});
-	}
-	if (state.vsharp_storage_variable != 0) {
-		state.builder.AddType({OpVariable, state.ptr_storage_buffer, state.vsharp_storage_variable,
-		                       StorageClassStorageBuffer});
-	}
-	if (state.address_memory_variable != 0) {
-		const auto count =
-		    ConstantU32(state, DescriptorCount(state, IR::DescriptorBindingKind::AddressMemory));
-		state.builder.AddType(
-		    {OpTypeArray, state.address_memory_array_type, state.storage_buffer_type, count});
-		state.builder.AddType({OpTypePointer, state.ptr_address_memory_array,
-		                       StorageClassStorageBuffer, state.address_memory_array_type});
-		state.builder.AddType({OpVariable, state.ptr_address_memory_array,
-		                       state.address_memory_variable, StorageClassStorageBuffer});
-	}
-	if (state.flattened_srt_variable != 0) {
-		state.builder.AddType({OpVariable, state.ptr_storage_buffer, state.flattened_srt_variable,
-		                       StorageClassStorageBuffer});
-	}
-	if (state.stage == ShaderType::Compute || state.needs_function_lds) {
-		const auto storage_class =
-		    state.needs_function_lds ? StorageClassFunction : StorageClassWorkgroup;
-		const auto lds_dwords = std::max(LdsDwordCount(state), 1u);
-		const auto lds_size   = ConstantU32(state, lds_dwords);
-		state.builder.AddType({OpTypeArray, state.lds_array_type, state.uint_type, lds_size});
-		state.builder.AddType(
-		    {OpTypePointer, state.ptr_workgroup_array, storage_class, state.lds_array_type});
-		state.builder.AddType(
-		    {OpTypePointer, state.ptr_workgroup_uint, storage_class, state.uint_type});
-		if (state.stage == ShaderType::Compute) {
-			state.builder.AddType(
-			    {OpVariable, state.ptr_workgroup_array, state.lds_variable, StorageClassWorkgroup});
+	if (state.requirements.subgroup_local_invocation_id) {
+		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
+		                                              "gl_SubgroupInvocationID");
+		state.subgroup_local_invocation_id_variable = variable;
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn,
+		                            spv::BuiltInSubgroupLocalInvocationId);
+		if (state.program.stage == ShaderType::Pixel) {
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
 		}
-	}
-	for (uint32_t i = 0; i < state.sampled_images.size(); i++) {
-		auto&      image     = state.sampled_images[i];
-		const auto view      = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
-		const bool integer   = i >= SampledImageViewKindCount;
-		const auto component = integer ? state.uint_type : state.float_type;
-		state.builder.AddType({OpTypeImage, image.image_type, component, ImageSpirvDimension(view),
-		                       0, ImageSpirvArrayed(view), ImageSpirvMultisampled(view), 1,
-		                       ImageFormatUnknown});
-		state.builder.AddType({OpTypeSampledImage, image.sampled_image_type, image.image_type});
-		state.builder.AddType(
-		    {OpTypePointer, image.pointer_type, StorageClassUniformConstant, image.image_type});
-		if (image.variable != 0) {
-			const auto kind  = SampledBindingKind(integer, view);
-			const auto count = ConstantU32(state, DescriptorCount(state, kind));
-			state.builder.AddType({OpTypeArray, image.array_type, image.image_type, count});
-			state.builder.AddType({OpTypePointer, image.array_pointer_type,
-			                       StorageClassUniformConstant, image.array_type});
-			state.builder.AddType({OpVariable, image.array_pointer_type, image.variable,
-			                       StorageClassUniformConstant});
-		}
-	}
-	state.builder.AddType({OpTypeSampler, state.sampler_type});
-	state.builder.AddType({OpTypePointer, state.ptr_uniform_sampler, StorageClassUniformConstant,
-	                       state.sampler_type});
-	if (state.sampler_variable != 0) {
-		const auto count =
-		    ConstantU32(state, DescriptorCount(state, IR::DescriptorBindingKind::Samplers));
-		state.builder.AddType({OpTypeArray, state.sampler_array_type, state.sampler_type, count});
-		state.builder.AddType({OpTypePointer, state.ptr_uniform_sampler_array,
-		                       StorageClassUniformConstant, state.sampler_array_type});
-		state.builder.AddType({OpVariable, state.ptr_uniform_sampler_array, state.sampler_variable,
-		                       StorageClassUniformConstant});
-	}
-	for (uint32_t i = 0; i < state.storage_images.size(); i++) {
-		auto&      image     = state.storage_images[i];
-		const auto view      = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
-		const bool integer   = i >= StorageImageViewKindCount;
-		const auto component = integer ? state.uint_type : state.float_type;
-		const auto format    = integer ? ImageFormatR32ui : ImageFormatUnknown;
-		state.builder.AddType({OpTypeImage, image.image_type, component, ImageSpirvDimension(view),
-		                       0, ImageSpirvArrayed(view), 0, 2, format});
-		state.builder.AddType(
-		    {OpTypePointer, image.pointer_type, StorageClassUniformConstant, image.image_type});
-		if (image.variable != 0) {
-			const auto kind  = StorageBindingKind(integer, view);
-			const auto count = ConstantU32(state, DescriptorCount(state, kind));
-			state.builder.AddType({OpTypeArray, image.array_type, image.image_type, count});
-			state.builder.AddType({OpTypePointer, image.array_pointer_type,
-			                       StorageClassUniformConstant, image.array_type});
-			state.builder.AddType({OpVariable, image.array_pointer_type, image.variable,
-			                       StorageClassUniformConstant});
-		}
-	}
-	state.builder.AddType(
-	    {OpTypePointer, state.ptr_image_uint, StorageClassImage, state.uint_type});
-	state.builder.AddType({OpTypeFunction, state.func_type, state.void_type});
-}
-
-void AllocateRegisterVariables(EmitterState& state) {
-	if (state.stage == ShaderType::Pixel && state.needs_pixel_valid_mask) {
-		state.pixel_valid_mask_variable = state.builder.AllocateId();
-		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
-	}
-	for (auto& binding: state.registers) {
-		binding.pointer_id = state.builder.AllocateId();
-		const auto name    = IR::RegisterToString(binding.reg);
-		state.builder.AddName(binding.pointer_id, name.c_str());
 	}
 }
 
-void AllocateDescriptorVariables(EmitterState& state) {
-	if (DescriptorBinding(state, IR::DescriptorBindingKind::Buffers) != nullptr) {
-		state.storage_buffer_variable = state.builder.AllocateId();
-	}
-	if (DescriptorBinding(state, IR::DescriptorBindingKind::AddressMemory) != nullptr) {
-		state.address_memory_variable = state.builder.AllocateId();
-	}
-	if (state.program.bindings.push_constant_size != 0) {
-		state.push_constant_variable = state.builder.AllocateId();
-	}
-	if (DescriptorBinding(state, IR::DescriptorBindingKind::UserData) != nullptr) {
-		state.vsharp_storage_variable = state.builder.AllocateId();
-	}
-	if (DescriptorBinding(state, IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
-		state.flattened_srt_variable = state.builder.AllocateId();
-	}
-	for (uint32_t i = 0; i < state.sampled_images.size(); i++) {
-		const auto view = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
-		if (DescriptorBinding(state, SampledBindingKind(i >= SampledImageViewKindCount, view)) !=
-		    nullptr) {
-			state.sampled_images[i].variable = state.builder.AllocateId();
+void DefineOutputs(EmitterState& state) {
+	state.outputs.reserve(state.program.info.outputs.size());
+	uint32_t clip_distance_count = 0;
+	uint32_t cull_distance_count = 0;
+	for (const auto& output: state.program.info.outputs) {
+		state.outputs.push_back({output});
+		if (output.kind == IR::StageOutputKind::ClipDistance) {
+			clip_distance_count = std::max(clip_distance_count, output.index + 1);
+		} else if (output.kind == IR::StageOutputKind::CullDistance) {
+			cull_distance_count = std::max(cull_distance_count, output.index + 1);
 		}
 	}
-	for (uint32_t i = 0; i < state.storage_images.size(); i++) {
-		const auto view = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
-		if (DescriptorBinding(state, StorageBindingKind(i >= StorageImageViewKindCount, view)) !=
-		    nullptr) {
-			state.storage_images[i].variable = state.builder.AllocateId();
+	if (state.program.stage == ShaderType::Mesh) {
+		DefineMeshOutputs(state);
+		return;
+	}
+	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
+	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
+		    return output.kind == IR::StageOutputKind::Position;
+	    })) {
+		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
+		state.invalid_position_clip_distance = clip_distance_count++;
+		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
+		                          state.invalid_position_clip_distance, 0, "gl_ClipDistance"}});
+	}
+	const auto BuiltIn = [&](uint32_t& variable, uint32_t type, const char* name,
+	                         spv::BuiltIn builtin) {
+		if (variable == 0) {
+			variable = DefineInterfaceVariable(state, type, spv::StorageClassOutput, name);
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn, builtin);
+		}
+		return variable;
+	};
+	for (auto& binding: state.outputs) {
+		switch (binding.kind) {
+			case IR::StageOutputKind::Position:
+				if (state.per_vertex_variable == 0) {
+					const auto type = PerVertexType(state);
+					state.builder.AddName(type, "gl_PerVertex");
+					state.per_vertex_variable = DefineInterfaceVariable(
+					    state, type, spv::StorageClassOutput, "outPerVertex");
+				}
+				binding.variable_id = state.per_vertex_variable;
+				break;
+			case IR::StageOutputKind::PointSize:
+				binding.variable_id = BuiltIn(state.point_size_variable, TypeF32(state),
+				                              "gl_PointSize", spv::BuiltInPointSize);
+				break;
+			case IR::StageOutputKind::ClipDistance:
+				binding.variable_id =
+				    BuiltIn(state.clip_distance_variable, F32ArrayType(state, clip_distance_count),
+				            "gl_ClipDistance", spv::BuiltInClipDistance);
+				break;
+			case IR::StageOutputKind::CullDistance:
+				binding.variable_id =
+				    BuiltIn(state.cull_distance_variable, F32ArrayType(state, cull_distance_count),
+				            "gl_CullDistance", spv::BuiltInCullDistance);
+				break;
+			case IR::StageOutputKind::Layer:
+				binding.variable_id =
+				    BuiltIn(state.layer_variable, TypeU32(state), "gl_Layer", spv::BuiltInLayer);
+				break;
+			case IR::StageOutputKind::ViewportIndex:
+				binding.variable_id = BuiltIn(state.viewport_index_variable, TypeU32(state),
+				                              "gl_ViewportIndex", spv::BuiltInViewportIndex);
+				break;
+			case IR::StageOutputKind::Depth:
+				binding.variable_id = BuiltIn(state.depth_variable, TypeF32(state), "gl_FragDepth",
+				                              spv::BuiltInFragDepth);
+				break;
+			case IR::StageOutputKind::SampleMask:
+				binding.variable_id =
+				    BuiltIn(state.sample_mask_variable, SampleMaskArrayType(state), "gl_SampleMask",
+				            spv::BuiltInSampleMask);
+				break;
+			case IR::StageOutputKind::Parameter:
+			case IR::StageOutputKind::Mrt: {
+				const bool uint_output =
+				    binding.kind == IR::StageOutputKind::Mrt &&
+				    state.program.stage == ShaderType::Pixel &&
+				    binding.index < std::size(state.input_info.pixel->target_output_mode) &&
+				    state.input_info.pixel->target_output_mode[binding.index] == 7u;
+				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
+				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
+				                                              binding.debug_name.c_str());
+				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&
+				                         state.program.stage == ShaderType::Pixel &&
+				                         state.input_info.pixel->dual_source_blending;
+				EXIT_NOT_IMPLEMENTED(dual_source && binding.index > 1);
+				state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
+				                            spv::DecorationLocation,
+				                            dual_source ? 0u : binding.location);
+				if (dual_source) {
+					state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
+					                            spv::DecorationIndex, binding.index);
+				}
+				break;
+			}
 		}
 	}
-	if (DescriptorBinding(state, IR::DescriptorBindingKind::Samplers) != nullptr) {
-		state.sampler_variable = state.builder.AllocateId();
+}
+
+} // namespace
+
+void DefineModule(EmitterState& state) {
+	state.interface_variables.reserve(state.program.info.inputs.size() +
+	                                  state.program.info.outputs.size());
+	DefineInputs(state);
+	DefineOutputs(state);
+	DefineTessellationInterfaces(state);
+	DefineDescriptors(state);
+	if (state.requirements.function_lds) {
+		state.lds_variable = state.builder.AllocateId();
 	}
-	if (DescriptorBinding(state, IR::DescriptorBindingKind::Gds) != nullptr) {
-		state.gds_variable = state.builder.AllocateId();
+	if (state.requirements.function_scratch) {
+		for (uint32_t half = 0; half < state.lane_count; half++) {
+			state.scratch_variable[half] = state.builder.AllocateId();
+		}
+	}
+	state.main_func = state.builder.AllocateId();
+	if (state.program.stage == ShaderType::Mesh) {
+		state.mesh_guest_func = state.builder.AllocateId();
+		state.builder.RequireCapability(spv::CapabilityMeshShadingEXT); // MeshShadingEXT
+		state.builder.RequireExtension("SPV_EXT_mesh_shader");
+		state.builder.AddExecutionMode(state.main_func,
+		                               spv::ExecutionModeOutputTrianglesEXT); // OutputTrianglesEXT
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
+		                               state.input_info.vertex->mesh.max_vertices);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,
+		                               state.input_info.vertex->mesh.max_primitives);
+	}
+	if (state.program.stage == ShaderType::TessellationControl ||
+	    state.program.stage == ShaderType::TessellationEvaluation) {
+		DefineTessellationExecutionModes(state);
+	}
+	state.entry_label = state.builder.AllocateId();
+
+	state.builder.RequireCapability(spv::CapabilityShader);
+	state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
+	if (state.program.info.uses_dma) {
+		state.builder.RequireCapability(spv::CapabilityInt64);
+		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
+		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
+	}
+	if (state.requirements.buffer_int64_atomics) {
+		state.builder.RequireCapability(spv::CapabilityInt64);
+		state.builder.RequireCapability(spv::CapabilityInt64Atomics);
+	}
+	if (state.clip_distance_variable != 0) {
+		state.builder.RequireCapability(spv::CapabilityClipDistance);
+	}
+	if (state.cull_distance_variable != 0) {
+		state.builder.RequireCapability(spv::CapabilityCullDistance);
+	}
+	if (state.layer_variable != 0 || InputVariableForKind(state, IR::StageInputKind::Layer) != 0) {
+		state.builder.RequireVersion(0x00010500u);
+		state.builder.RequireCapability(spv::CapabilityShaderLayer);
+	}
+	if (state.viewport_index_variable != 0) {
+		state.builder.RequireVersion(0x00010500u);
+		state.builder.RequireCapability(spv::CapabilityShaderViewportIndex);
+	}
+	if (InputVariableForKind(state, IR::StageInputKind::SampleId) != 0) {
+		state.builder.RequireCapability(spv::CapabilitySampleRateShading);
+	}
+	if (state.requirements.image_gather_extended) {
+		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
+	}
+	if (state.lane_count == 2 || state.requirements.subgroup_ballot ||
+	    state.requirements.subgroup_shuffle || state.requirements.subgroup_local_invocation_id) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+	}
+	if (state.lane_count == 2 || state.requirements.subgroup_ballot) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+	}
+	if (state.requirements.subgroup_shuffle) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
+	}
+	if (state.requirements.compute_derivatives && state.program.stage == ShaderType::Compute) {
+		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
+		state.builder.RequireExtension("SPV_KHR_compute_shader_derivatives");
+	}
+	const bool fragment_barycentric =
+	    state.program.stage == ShaderType::Pixel &&
+	    std::any_of(state.inputs.begin(), state.inputs.end(), [](const InputBinding& input) {
+		    return input.per_vertex || input.kind == IR::StageInputKind::BaryCoordSmooth ||
+		           input.kind == IR::StageInputKind::BaryCoordNoPerspective;
+	    });
+	if (fragment_barycentric) {
+		state.builder.RequireCapability(spv::CapabilityFragmentBarycentricKHR);
+		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
+	}
+	state.builder.RequireExtension("SPV_KHR_float_controls");
+	state.builder.AddMemoryModel(state.program.info.uses_dma
+	                                 ? spv::AddressingModelPhysicalStorageBuffer64
+	                                 : spv::AddressingModelLogical,
+	                             spv::MemoryModelGLSL450);
+	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
+	// contract prevents host compilers from treating synthesized IEEE values as finite.
+	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
+	                               32u);
+	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
+		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
+		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;
+		uint32_t    local_z = 1u;
+		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
+		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
+		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
+		if (state.lane_count == 2) {
+			local_x = ((local_x * local_y * local_z + 63u) / 64u) * 32u;
+			local_y = local_z = 1u;
+			if (state.requirements.compute_derivatives) {
+				local_y = local_x / 2u;
+				local_x = 2u;
+			}
+		}
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeLocalSize, local_x,
+		                               local_y, local_z);
+	}
+	if (state.program.stage == ShaderType::Pixel) {
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOriginUpperLeft);
+		if (state.depth_variable != 0) {
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDepthReplacing);
+		}
+		if (state.input_info.pixel->ps_early_z && !state.input_info.pixel->ps_pixel_kill_enable &&
+		    !state.input_info.pixel->ps_depth_export_enable &&
+		    !state.input_info.pixel->ps_sample_mask_export_enable) {
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
+		}
+	}
+	if (state.requirements.compute_derivatives && state.program.stage == ShaderType::Compute) {
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupQuadsKHR);
+	}
+	state.builder.AddName(state.main_func, "main");
+	if (state.requirements.function_lds) {
+		state.builder.AddName(state.lds_variable, "lds_dwords");
+	}
+	if (state.requirements.function_scratch) {
+		for (uint32_t half = 0; half < state.lane_count; half++) {
+			state.builder.AddName(state.scratch_variable[half], "scratch_dwords");
+		}
 	}
 }
 

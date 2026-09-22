@@ -13,17 +13,16 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
-#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/renderDoc.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
 #include <list>
 #include <thread>
 #include <vector>
@@ -38,17 +37,15 @@ LIB_NAME("VideoOut", "VideoOut");
 
 namespace EventQueue = LibKernel::EventQueue;
 
-const bool g_fast_loading_vblank = [] {
-	const char* value = std::getenv("MAGNUS_FAST_LOADING");
-	return value != nullptr && value[0] == '1';
-}();
-
 constexpr int      VIDEO_OUT_EVENT_FLIP                                 = 0;
 constexpr int      VIDEO_OUT_EVENT_VBLANK                               = 1;
 constexpr int      VIDEO_OUT_EVENT_PRE_VBLANK_START                     = 2;
 constexpr int      VIDEO_OUT_EVENT_SET_MODE                             = 8;
 constexpr int      VIDEO_OUT_TRUE                                       = 1;
 constexpr int      VIDEO_OUT_FALSE                                      = 0;
+constexpr int      VIDEO_OUT_BUS_TYPE_MAIN                              = 0;
+constexpr int      VIDEO_OUT_BUS_TYPE_OVERLAY                           = 1;
+constexpr int      VIDEO_OUT_BUS_TYPE_SUB                               = 2;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC                            = 1;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC_MULTI                      = 4;
 constexpr int      VIDEO_OUT_BUFFER_INDEX_BLACK                         = -2;
@@ -108,6 +105,7 @@ struct VideoOutBufferAttribute2 {
 	uint64_t reserved1[3];
 };
 
+// PS5 layout
 struct VideoOutFlipStatus {
 	uint64_t count                    = 0;
 	uint64_t processTime              = 0;
@@ -123,6 +121,7 @@ struct VideoOutFlipStatus {
 	uint64_t reserved3[7]             = {};
 };
 
+// PS5 layout
 struct VideoOutVblankStatus {
 	uint64_t count              = 0;
 	uint64_t processTime        = 0;
@@ -181,9 +180,8 @@ struct VideoOutConfig {
 	uint64_t                            generation  = 0;
 	bool                                opened      = false;
 	bool                                closing     = false;
-	int                                 flip_rate         = 0;
-	uint64_t                            next_flip_vblank  = 0;
-	uint64_t                            output_mode       = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
+	int                                 flip_rate   = 0;
+	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
 	VideoOutVblankStatus                pre_vblank_status;
@@ -239,7 +237,9 @@ private:
 
 struct VideoOutDriver::Impl {
 public:
-	static constexpr int VIDEO_OUT_NUM_MAX = 2;
+	static constexpr std::array VIDEO_OUT_BUSES {
+	    VIDEO_OUT_BUS_TYPE_MAIN, VIDEO_OUT_BUS_TYPE_OVERLAY, VIDEO_OUT_BUS_TYPE_SUB};
+	static constexpr int VIDEO_OUT_NUM_MAX = VIDEO_OUT_BUSES.size() + 1;
 
 	Impl(uint32_t width, uint32_t height, Graphics::Presenter& presenter)
 	    : m_renderer(presenter.Renderer()), m_presenter(presenter), m_flip_queue(presenter) {
@@ -250,7 +250,7 @@ public:
 	~Impl();
 	KYTY_CLASS_NO_COPY(Impl);
 
-	int             Open();
+	int             Open(int bus_type, int index);
 	bool            Close(int handle);
 	VideoOutConfig* Get(int handle);
 	VideoOutConfig* Get(int handle, uint64_t& generation);
@@ -481,7 +481,9 @@ static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
 		return false;
 	}
-	return cfg.vblank_status.count >= cfg.next_flip_vblank;
+	const int interval = cfg.flip_rate + 1;
+
+	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
 }
 
 static bool IsValidBufferIndex(int index) {
@@ -610,20 +612,17 @@ void VideoOutDriver::Impl::Init(uint32_t width, uint32_t height) {
 	}
 }
 
-int VideoOutDriver::Impl::Open() {
+int VideoOutDriver::Impl::Open(int bus_type, int index) {
+	const auto bus = std::find(VIDEO_OUT_BUSES.begin(), VIDEO_OUT_BUSES.end(), bus_type);
+	if (bus == VIDEO_OUT_BUSES.end()) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	EXIT_NOT_IMPLEMENTED(index != 0);
 	Common::LockGuard lock(m_mutex);
 
-	int handle = -1;
-
-	for (int i = 1; i < VIDEO_OUT_NUM_MAX; i++) {
-		if (!m_video_out_ctx[i].opened) {
-			handle = i;
-			break;
-		}
-	}
-
-	if (handle < 0) {
-		return -1;
+	const int handle = static_cast<int>(bus - VIDEO_OUT_BUSES.begin()) + 1;
+	if (m_video_out_ctx[handle].opened) {
+		return VIDEO_OUT_ERROR_RESOURCE_BUSY;
 	}
 	auto&             config = m_video_out_ctx[handle];
 	Common::LockGuard config_lock(config.mutex);
@@ -653,7 +652,6 @@ int VideoOutDriver::Impl::Open() {
 	config.flip_status.flipArg       = -1;
 	config.flip_status.currentBuffer = -1;
 	config.flip_status.count         = 0;
-	config.next_flip_vblank          = 0;
 	config.pre_vblank_status         = VideoOutVblankStatus();
 	config.vblank_status             = VideoOutVblankStatus();
 
@@ -689,8 +687,7 @@ bool VideoOutDriver::Impl::Close(int handle) {
 			vblank_events      = std::move(config.events->vblank);
 			output_mode_events = std::move(config.events->output_mode);
 		}
-		config.flip_rate         = 0;
-		config.next_flip_vblank = 0;
+		config.flip_rate = 0;
 
 		for (const auto& buffer: config.buffers) {
 			if (buffer.Occupied() &&
@@ -804,25 +801,22 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		const auto frame_begin = Common::Timer::QueryPerformanceCounter();
 		total_wait -= static_cast<int64_t>(frame_begin - sleep_begin);
 
-		const auto base_refresh = std::max(Config::GetVblankFrequency(), 1u);
-		const auto refresh      = g_fast_loading_vblank && !m_presenter.IsGuestVisible()
-		                              ? base_refresh * 10u
-		                              : base_refresh;
+		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
 		const auto period  = std::max(frequency / refresh, uint64_t {1});
 
 		if (m_presenter.IsGuestPaused()) {
+			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
+				m_presenter.Present(*frame, true);
+			}
 			const auto frame_end = Common::Timer::QueryPerformanceCounter();
 			total_wait +=
 			    static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
-			if (total_wait < 0) {
-				total_wait = 0;
-			}
 			continue;
 		}
 
 		VblankBegin();
 		bool presented = m_flip_queue.Flip(0);
-		if (!presented && m_presenter.NeedsImeRefresh()) {
+		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
 				m_presenter.Present(*frame, true);
 				presented = true;
@@ -860,9 +854,6 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
 		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
-		if (total_wait < 0) {
-			total_wait = 0;
-		}
 	}
 }
 
@@ -1138,8 +1129,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_requests.front().state = RequestState::Presenting;
 	m_mutex.Unlock();
 
-	m_presenter.Present(*r.frame, false);
-	m_presenter.NoteGuestPresent();
+	m_presenter.Present(*r.frame);
 
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
@@ -1148,8 +1138,6 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	m_requests.pop_front();
 
-	r.cfg->next_flip_vblank =
-	    r.cfg->vblank_status.count + static_cast<uint64_t>(r.cfg->flip_rate + 1);
 	r.cfg->flip_status.count++;
 	r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 	r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
@@ -1168,8 +1156,10 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_mutex.Unlock();
 	r.cfg->mutex.Unlock();
 
+	Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
+
 	if (Config::GraphicsDebugDumpEnabled() &&
-	    Config::GetPrintfDirection() != Config::OutputDirection::Silent) {
+	    Config::GetPrintfDirection() != Config::LogDirection::Silent) {
 		LOGF("Flip done: %d\n", r.index);
 	}
 
@@ -1186,18 +1176,9 @@ KYTY_SYSV_ABI int VideoOutOpen(int user_id, int bus_type, int index, const void*
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(user_id != 255 && user_id != 0);
-	EXIT_NOT_IMPLEMENTED(bus_type != 0);
-	EXIT_NOT_IMPLEMENTED(index != 0);
-
 	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
 
-	int handle = DriverState().Open();
-
-	if (handle < 0) {
-		return VIDEO_OUT_ERROR_RESOURCE_BUSY;
-	}
-
-	return handle;
+	return DriverState().Open(bus_type, index);
 }
 
 KYTY_SYSV_ABI int VideoOutClose(int handle) {
@@ -1253,8 +1234,7 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	}
 
 	Common::LockGuard lock(ctx->mutex);
-	ctx->flip_rate          = rate;
-	ctx->next_flip_vblank   = ctx->vblank_status.count;
+	ctx->flip_rate = rate;
 
 	return OK;
 }

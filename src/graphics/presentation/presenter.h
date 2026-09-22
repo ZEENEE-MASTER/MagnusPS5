@@ -25,11 +25,9 @@ public:
 	                                               CommandBuffer* producer = nullptr);
 	[[nodiscard]] Frame*         PrepareLastFrame();
 	[[nodiscard]] bool           IsGuestPaused() const noexcept;
-	[[nodiscard]] bool           IsGuestVisible() const noexcept;
-	[[nodiscard]] bool           NeedsImeRefresh() const noexcept;
+	[[nodiscard]] bool           NeedsSystemOverlayRefresh() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;
 	void                         Present(Frame& frame, bool reuse = false);
-	void                         NoteGuestPresent();
 	void                         Discard(Frame& frame);
 
 private:

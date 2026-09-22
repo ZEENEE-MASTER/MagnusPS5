@@ -54,17 +54,6 @@ struct CallPlt {
 	                    0x73, 0x08, 0x41, 0xFF, 0x63, 0x10, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
 };
 
-// The tail of the CallPlt path. CallPlt pushes the Program* and JmpWithIndex pushed the
-// relocation index, so the handler returns onto this, which drops the index and returns to
-// the address the guest's own call pushed.
-struct RelocateReturn {
-	static uint64_t GetSize() { return 5; }
-
-	// 0: 48 83 c4 08    add rsp,0x8
-	// 4: c3             ret
-	uint8_t code[5] = {0x48, 0x83, 0xC4, 0x08, 0xC3};
-};
-
 struct JmpRax {
 	template <class Handler>
 	void SetFunc(Handler func) {
@@ -80,21 +69,22 @@ struct Call9 {
 	template <class Handler>
 	void SetFunc(Handler func) {
 		auto func_addr = reinterpret_cast<int64_t>(reinterpret_cast<void*>(func));
-		auto rip_addr  = reinterpret_cast<int64_t>(&code[5]);
+		auto rip_addr  = reinterpret_cast<int64_t>(&code[6]);
 		auto offset64  = func_addr - rip_addr;
 		auto offset32  = static_cast<uint32_t>(static_cast<uint64_t>(offset64) & 0xffffffffu);
 
-		*reinterpret_cast<uint32_t*>(&code[1]) = offset32;
+		*reinterpret_cast<uint32_t*>(&code[2]) = offset32;
 	}
 
-	void SetOutputReg(uint8_t reg) { code[7] = 0xc0u | (reg & 7u); }
+	void SetOutputReg(uint8_t reg) { code[8] = 0xc0u | (reg & 7u); }
 
 	static uint64_t GetSize() { return 9; }
 
-	// call func
+	// rex.w; call func
 	// mov rax,rax
-	// nop
-	uint8_t code[9] = {0xE8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0xC0, 0x90};
+	// REX.W is required because AMD processors honor a retained 0x66 operand-size
+	// prefix on a near call and would otherwise execute callw.
+	uint8_t code[9] = {0x48, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0xC0};
 };
 
 struct TlsRegStub {

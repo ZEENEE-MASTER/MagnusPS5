@@ -2,16 +2,13 @@
 #define EMULATOR_INCLUDE_EMULATOR_LIBS_VACONTEXT_H_
 
 #include <cstddef>
-#include <cstdint>
-#if defined(__x86_64__) || defined(_M_X64)
 #include <xmmintrin.h>
-#endif
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define VA_ARGS                                                                                    \
 	uint64_t rdi, uint64_t rsi, uint64_t rdx, uint64_t rcx, uint64_t r8, uint64_t r9,              \
-	    uint64_t overflow_arg_area, VaXmm xmm0, VaXmm xmm1, VaXmm xmm2, VaXmm xmm3, VaXmm xmm4,    \
-	    VaXmm xmm5, VaXmm xmm6, VaXmm xmm7, ...
+	    uint64_t overflow_arg_area, __m128 xmm0, __m128 xmm1, __m128 xmm2, __m128 xmm3,            \
+	    __m128 xmm4, __m128 xmm5, __m128 xmm6, __m128 xmm7, ...
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define VA_CONTEXT(ctx)                                                                            \
@@ -37,15 +34,6 @@
 
 namespace Libs {
 
-// One XMM slot of the guest's SysV register save area. Nothing here does vector arithmetic on
-// it, so off x86 it only has to be sixteen bytes; this is the definition xmmintrin.h gives
-// __m128, written out, because the x86 intrinsic headers refuse to compile on other targets.
-#if defined(__x86_64__) || defined(_M_X64)
-using VaXmm = __m128;
-#else
-using VaXmm = float __attribute__((__vector_size__(16), __aligned__(16)));
-#endif
-
 #pragma pack(1)
 
 struct VaList {
@@ -55,22 +43,17 @@ struct VaList {
 	void*    reg_save_area;
 };
 
+// typedef float __m128 __attribute__((__vector_size__(16), __aligned__(16)));
+
 struct VaRegSave {
 	uint64_t gp[6];
-	VaXmm    fp[8];
+	__m128   fp[8];
 };
 
 struct VaContext {
 	VaRegSave reg_save_area;
 	VaList    va_list;
 };
-
-// VaArg_int and VaArg_double compare against 40 and 160, which are the last general-purpose
-// and last floating-point slots of the guest's save area. Those bounds are only right while
-// the area keeps its SysV shape.
-static_assert(offsetof(VaRegSave, gp) == 0);
-static_assert(offsetof(VaRegSave, fp) == 48);
-static_assert(sizeof(VaRegSave) == 176);
 
 struct VaCharX16 {
 	char x[16];

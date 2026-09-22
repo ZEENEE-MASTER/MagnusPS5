@@ -6,16 +6,11 @@
 #include "common/stringUtils.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
-#include "kernel/fileSystem.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 
-#include <algorithm>
-#include <cctype>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <string>
 #include <system_error>
 
 namespace Libs {
@@ -30,8 +25,6 @@ constexpr int      APP_CONTENT_ERROR_NOT_MOUNTED        = -2133262332; /* 0x80D9
 constexpr int      APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT = -2133262329; /* 0x80D90007 */
 
 static std::string g_title_id;
-static std::filesystem::path g_addcont_root;
-static uint32_t g_mount_index = 0;
 
 struct AppContentInitParam {
 	char reserved[32];
@@ -58,17 +51,17 @@ static bool TryGetTitleIdFromContentId(std::string* title_id) {
 		return false;
 	}
 
-	const uint32_t dash = Common::FindIndex(content_id, '-');
-	if (!Common::IndexValid(content_id, dash)) {
+	const auto dash = content_id.find('-');
+	if (dash == std::string::npos) {
 		return false;
 	}
 
-	const uint32_t underscore = Common::FindIndex(content_id, '_', dash + 1);
-	if (!Common::IndexValid(content_id, underscore) || underscore <= dash + 1) {
+	const auto underscore = content_id.find('_', dash + 1);
+	if (underscore == std::string::npos || underscore <= dash + 1) {
 		return false;
 	}
 
-	*title_id = Common::Mid(content_id, dash + 1, underscore - dash - 1);
+	*title_id = content_id.substr(dash + 1, underscore - dash - 1);
 	return !title_id->empty();
 }
 
@@ -83,15 +76,6 @@ static bool ResolveTitleId(std::string* title_id) {
 	}
 
 	return false;
-}
-
-static bool ValidEntitlementLabel(const std::string& label) {
-	if (label.empty() || label.size() > 16) {
-		return false;
-	}
-	return std::all_of(label.begin(), label.end(), [](unsigned char value) {
-		return std::isalnum(value) != 0 || value == '_' || value == '-';
-	});
 }
 
 int KYTY_SYSV_ABI AppContentInitialize(const AppContentInitParam* init_param,
@@ -110,22 +94,6 @@ int KYTY_SYSV_ABI AppContentInitialize(const AppContentInitParam* init_param,
 		LOGF("\t title_id   = %s\n", g_title_id.c_str());
 	} else {
 		LOGF("\t TITLE_ID missing\n");
-	}
-
-	g_addcont_root.clear();
-	g_mount_index = 0;
-	if (const char* root = std::getenv("MAGNUS_DLC_ROOT"); root != nullptr && root[0] != '\0') {
-		std::error_code ec;
-		g_addcont_root = root;
-		if (!std::filesystem::is_directory(g_addcont_root, ec)) {
-			LOGF("\t DLC root unavailable: %s [%s]\n", g_addcont_root.string().c_str(),
-			     ec.message().c_str());
-			g_addcont_root.clear();
-		} else {
-			LOGF("\t DLC root    = %s\n", g_addcont_root.string().c_str());
-		}
-	} else {
-		LOGF("\t MAGNUS_DLC_ROOT missing\n");
 	}
 
 	return OK;
@@ -209,31 +177,8 @@ int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         servic
 	}
 
 	std::memset(mount_point->data, 0, sizeof(mount_point->data));
-	const size_t label_size = strnlen(entitlement_label->data, sizeof(entitlement_label->data));
-	const std::string label(entitlement_label->data, label_size);
-	if (!ValidEntitlementLabel(label) || g_addcont_root.empty()) {
-		LOGF("\t entitlement unavailable: %s\n", label.c_str());
-		return APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT;
-	}
 
-	const auto content = g_addcont_root / label;
-	std::error_code ec;
-	if (!std::filesystem::is_directory(content, ec)) {
-		LOGF("\t entitlement path unavailable: %s [%s]\n", content.string().c_str(),
-		     ec.message().c_str());
-		return APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT;
-	}
-
-	const std::string mount = "/addcont" + std::to_string(g_mount_index++);
-	if (mount.size() >= sizeof(mount_point->data)) {
-		LOGF("\t mount name overflow: %s\n", mount.c_str());
-		return APP_CONTENT_ERROR_NOT_MOUNTED;
-	}
-	Libs::LibKernel::FileSystem::Mount(content, mount);
-	std::memcpy(mount_point->data, mount.data(), mount.size());
-	LOGF("\t mounted %s -> %s\n", mount.c_str(), content.string().c_str());
-
-	return OK;
+	return APP_CONTENT_ERROR_DRM_NO_ENTITLEMENT;
 }
 
 int KYTY_SYSV_ABI AppContentAddcontUnmount(const AppContentMountPoint* mount_point) {
@@ -248,10 +193,6 @@ int KYTY_SYSV_ABI AppContentAddcontUnmount(const AppContentMountPoint* mount_poi
 	if (mount_point->data[0] == '\0') {
 		return APP_CONTENT_ERROR_NOT_MOUNTED;
 	}
-	char mount[sizeof(mount_point->data) + 1] {};
-	std::memcpy(mount, mount_point->data, sizeof(mount_point->data));
-	Libs::LibKernel::FileSystem::Umount(mount);
-	LOGF("\t unmounted %s\n", mount);
 
 	return OK;
 }

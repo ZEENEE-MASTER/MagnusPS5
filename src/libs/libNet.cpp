@@ -7,25 +7,13 @@
 #include "libs/network.h"
 #include "loader/symbolDatabase.h"
 
-#include <algorithm>
 #include <cctype>
-#include <cstdlib>
+#include <cstddef>
 #include <cstring>
-#include <filesystem>
 #include <map>
 #include <mutex>
 #include <string>
 #include <vector>
-
-// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define NET_CALL(func)                                                                             \
-	[&]() {                                                                                        \
-		auto result = func;                                                                        \
-		if (result < 0) {                                                                          \
-			*GetNetErrorAddr() = result;                                                           \
-		}                                                                                          \
-		return result;                                                                             \
-	}()
 
 namespace Libs {
 
@@ -46,8 +34,15 @@ KYTY_SYSV_ABI int* GetNetErrorAddr() {
 	return &g_net_errno;
 }
 
+static int FinishNetCall(int result) {
+	if (result < 0) {
+		g_net_errno = result - Network::NET_ERROR_EPERM + 1;
+	}
+	return result;
+}
+
 static int KYTY_SYSV_ABI NetInit() {
-	return NET_CALL(Net::NetInit());
+	return FinishNetCall(Net::NetInit());
 }
 
 static int PosixToNetError(int error) {
@@ -69,13 +64,7 @@ static int PosixToNetError(int error) {
 }
 
 static int FinishSocketCall(int result) {
-	if (result >= 0) {
-		return result;
-	}
-
-	const int net_error = PosixToNetError(*Posix::GetErrorAddr());
-	*GetNetErrorAddr()  = net_error;
-	return net_error;
+	return FinishNetCall(result < 0 ? PosixToNetError(*Posix::GetErrorAddr()) : result);
 }
 
 int KYTY_SYSV_ABI NetSocket(const char* name, int family, int type, int protocol) {
@@ -105,44 +94,48 @@ int KYTY_SYSV_ABI NetGetsockname(int s, void* addr, uint32_t* addrlen) {
 }
 
 int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags) {
-	return NET_CALL(Net::NetPoolCreate(name, size, flags));
+	return FinishNetCall(Net::NetPoolCreate(name, size, flags));
 }
 
 int KYTY_SYSV_ABI NetPoolDestroy(int memid) {
-	return NET_CALL(Net::NetPoolDestroy(memid));
+	return FinishNetCall(Net::NetPoolDestroy(memid));
 }
 
 int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
-	return NET_CALL(Net::NetResolverCreate(name, memid, flags));
+	return FinishNetCall(Net::NetResolverCreate(name, memid, flags));
+}
+
+int KYTY_SYSV_ABI NetResolverDestroy(int rid) {
+	return FinishNetCall(Net::NetResolverDestroy(rid));
 }
 
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags) {
-	return NET_CALL(Net::NetResolverStartNtoa(rid, hostname, addr, timeout, retry, flags));
+	return FinishNetCall(Net::NetResolverStartNtoa(rid, hostname, addr, timeout, retry, flags));
 }
 
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst) {
-	return NET_CALL(Net::NetInetPton(af, src, dst));
+	return FinishNetCall(Net::NetInetPton(af, src, dst));
 }
 
 const char* KYTY_SYSV_ABI NetInetNtop(int af, const void* src, char* dst, uint32_t size) {
 	const char* result = Net::NetInetNtop(af, src, dst, size);
 	if (result == nullptr) {
-		*GetNetErrorAddr() = PosixToNetError(*Posix::GetErrorAddr());
+		FinishNetCall(PosixToNetError(*Posix::GetErrorAddr()));
 	}
 	return result;
 }
 
 int KYTY_SYSV_ABI NetEtherNtostr(const Net::NetEtherAddr* n, char* str, size_t len) {
-	return NET_CALL(Net::NetEtherNtostr(n, str, len));
+	return FinishNetCall(Net::NetEtherNtostr(n, str, len));
 }
 
 int KYTY_SYSV_ABI NetGetMacAddress(Net::NetEtherAddr* addr, int flags) {
-	return NET_CALL(Net::NetGetMacAddress(addr, flags));
+	return FinishNetCall(Net::NetGetMacAddress(addr, flags));
 }
 
 int KYTY_SYSV_ABI NetGetSockInfo(int s, void* info, int n, int flags) {
-	return NET_CALL(Net::NetGetSockInfo(s, info, n, flags));
+	return FinishNetCall(Net::NetGetSockInfo(s, info, n, flags));
 }
 
 int KYTY_SYSV_ABI NetEpollCreate(const char* name, int flags) {
@@ -162,12 +155,12 @@ int KYTY_SYSV_ABI NetEpollDestroy(int eid) {
 }
 
 int KYTY_SYSV_ABI NetSocketClose(int s) {
-	return NET_CALL(Net::SocketClose(s));
+	return FinishNetCall(Net::SocketClose(s));
 }
 
 int KYTY_SYSV_ABI NetSetsockopt(int s, int level, int optname, const void* optval,
                                 uint32_t optlen) {
-	return NET_CALL(Net::Setsockopt(s, level, optname, optval, optlen));
+	return FinishSocketCall(Net::Setsockopt(s, level, optname, optval, optlen));
 }
 
 uint32_t KYTY_SYSV_ABI NetHtonl(uint32_t host32) {
@@ -197,6 +190,7 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("dgJBaeJnGpo", LibNet::NetPoolCreate);
 	LIB_FUNC("K7RlrTkI-mw", LibNet::NetPoolDestroy);
 	LIB_FUNC("C4UgDHHPvdw", LibNet::NetResolverCreate);
+	LIB_FUNC("kJlYH5uMAWI", LibNet::NetResolverDestroy);
 	LIB_FUNC("Nd91WaWmG2w", LibNet::NetResolverStartNtoa);
 	LIB_FUNC("8Kcp5d-q1Uo", LibNet::NetInetPton);
 	LIB_FUNC("9vA2aW+CHuA", LibNet::NetInetNtop);
@@ -633,6 +627,7 @@ LIB_DEFINE(InitNet_1_Http) {
 	LIB_FUNC("P6A3ytpsiYc", Http::HttpDeleteConnection);
 	LIB_FUNC("tsGVru3hCe8", Http::HttpCreateRequest);
 	LIB_FUNC("Aeu5wVKkF9w", Http::HttpCreateRequest);
+	LIB_FUNC("rGNm+FjIXKk", Http::HttpCreateRequest2);
 	LIB_FUNC("Cnp77podkCU", Http::HttpCreateRequestWithURL2);
 	LIB_FUNC("qe7oZ+v4PWA", Http::HttpDeleteRequest);
 	LIB_FUNC("PTiFIUxCpJc", Http::HttpSetRequestContentLength);
@@ -1411,13 +1406,41 @@ namespace LibNpCommerce {
 
 LIB_VERSION("NpCommerce", 1, "NpCommerce", 1, 1);
 
+constexpr int COMMERCE_STATUS_NONE        = 0;
+constexpr int COMMERCE_STATUS_INITIALIZED = 1;
+
+constexpr int COMMERCE_ERROR_NOT_INITIALIZED     = static_cast<int>(0x80B80003u);
+constexpr int COMMERCE_ERROR_ALREADY_INITIALIZED = static_cast<int>(0x80B80004u);
+
+static int g_commerce_status = COMMERCE_STATUS_NONE;
+
+static int KYTY_SYSV_ABI NpCommerceDialogInitialize() {
+	PRINT_NAME();
+	if (g_commerce_status != COMMERCE_STATUS_NONE) {
+		return COMMERCE_ERROR_ALREADY_INITIALIZED;
+	}
+	g_commerce_status = COMMERCE_STATUS_INITIALIZED;
+	return OK;
+}
+
+static int KYTY_SYSV_ABI NpCommerceDialogTerminate() {
+	PRINT_NAME();
+	if (g_commerce_status == COMMERCE_STATUS_NONE) {
+		return COMMERCE_ERROR_NOT_INITIALIZED;
+	}
+	g_commerce_status = COMMERCE_STATUS_NONE;
+	return OK;
+}
+
 static int KYTY_SYSV_ABI NpCommerceDialogUpdateStatus() {
 	PRINT_NAME();
 
-	return 0; // SCE_COMMON_DIALOG_STATUS_NONE
+	return g_commerce_status;
 }
 
 LIB_DEFINE(InitNet_1_NpCommerce) {
+	LIB_FUNC("0aR2aWmQal4", NpCommerceDialogInitialize);
+	LIB_FUNC("m-I92Ab50W8", NpCommerceDialogTerminate);
 	LIB_FUNC("LR5cwFMMCVE", NpCommerceDialogUpdateStatus);
 }
 
@@ -1434,7 +1457,7 @@ LIB_DEFINE(InitNet_1_NpManager) {
 	LIB_FUNC("Ec63y59l9tw", NpManager::NpSetNpTitleId);
 	LIB_FUNC("A2CQ3kgSopQ", NpManager::NpSetContentRestriction);
 	LIB_FUNC("VfRSmPmj8Q8", NpManager::NpRegisterStateCallback);
-	LIB_FUNC("qQJfO8HAiaY", NpManager::NpRegisterStateCallback);
+	LIB_FUNC("qQJfO8HAiaY", NpManager::NpRegisterStateCallbackA);
 	LIB_FUNC("M3wFXbYQtAA", NpManager::NpUnregisterStateCallback);
 	LIB_FUNC("uFJpaKNBAj4", NpManager::NpRegisterGamePresenceCallback);
 	LIB_FUNC("GImICnh+boA", NpManager::NpRegisterPlusEventCallback);
@@ -1505,51 +1528,11 @@ struct NpEntitlementAccessAddcontEntitlementInfo {
 	uint32_t                  download_status;
 };
 
-static std::vector<NpEntitlementAccessAddcontEntitlementInfo> AvailableAddcontEntitlements() {
-	std::vector<NpEntitlementAccessAddcontEntitlementInfo> available;
-	const char* root = std::getenv("MAGNUS_DLC_ROOT");
-	if (root == nullptr || root[0] == '\0') {
-		return available;
-	}
-	std::error_code ec;
-	std::filesystem::directory_iterator entries(root, ec);
-	if (ec) {
-		LOGF("\t DLC entitlement scan failed: %s [%s]\n", root, ec.message().c_str());
-		return available;
-	}
-	for (const auto& entry: entries) {
-		if (!entry.is_directory(ec)) {
-			if (ec) {
-				LOGF("\t DLC entitlement entry failed: %s [%s]\n",
-				     entry.path().string().c_str(), ec.message().c_str());
-				ec.clear();
-			}
-			continue;
-		}
-		const std::string label = entry.path().filename().string();
-		if (label.empty() || label.size() > 16 ||
-		    !std::all_of(label.begin(), label.end(), [](unsigned char value) {
-			    return std::isalnum(value) != 0 || value == '_' || value == '-';
-		    })) {
-			LOGF("\t DLC entitlement name rejected: %s\n", label.c_str());
-			continue;
-		}
-		const bool duplicate = std::any_of(
-		    available.begin(), available.end(), [&label](const auto& entitlement) {
-			    return strncmp(label.c_str(), entitlement.entitlement_label.data,
-			                   sizeof(entitlement.entitlement_label.data)) == 0;
-		    });
-		if (duplicate) {
-			continue;
-		}
-		NpEntitlementAccessAddcontEntitlementInfo entitlement {};
-		std::memcpy(entitlement.entitlement_label.data, label.data(), label.size());
-		entitlement.package_type = 3;
-		entitlement.download_status = 4;
-		available.push_back(entitlement);
-	}
-	return available;
-}
+static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS_ADDON_LIST[] = {
+    {{{"85y-je"}, {}}, 3, 4}, // GTA V hash 0xf4315381
+    {{{"5d5c48"}, {}}, 3, 4}, // GTA V hash 0x961c34b0
+    {{{"_mtqu6"}, {}}, 3, 4}, // GTA V hash 0x9cd1bcad
+};
 
 static int KYTY_SYSV_ABI NpEntitlementAccessInitialize(
     const NpEntitlementAccessInitParam* init_param, NpEntitlementAccessBootParam* boot_param) {
@@ -1589,15 +1572,15 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfoList(
 		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
 	}
 
-	const auto available = AvailableAddcontEntitlements();
-	*hit_num = static_cast<uint32_t>(available.size());
+	*hit_num = static_cast<uint32_t>(sizeof(NP_ENTITLEMENT_ACCESS_ADDON_LIST) /
+	                                 sizeof(NP_ENTITLEMENT_ACCESS_ADDON_LIST[0]));
 
 	if (list != nullptr && list_num != 0) {
 		memset(list, 0, sizeof(*list) * list_num);
 
 		const auto copy_num = (list_num < *hit_num ? list_num : *hit_num);
 		for (uint32_t i = 0; i < copy_num; i++) {
-			list[i] = available[i];
+			list[i] = NP_ENTITLEMENT_ACCESS_ADDON_LIST[i];
 		}
 	}
 
@@ -1620,7 +1603,7 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 
 	memset(info, 0, sizeof(*info));
 
-	for (const auto& entitlement: AvailableAddcontEntitlements()) {
+	for (const auto& entitlement: NP_ENTITLEMENT_ACCESS_ADDON_LIST) {
 		if (strncmp(entitlement_label->data, entitlement.entitlement_label.data,
 		            sizeof(entitlement_label->data)) == 0) {
 			*info = entitlement;
@@ -1841,9 +1824,15 @@ static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(int req_id, const void* pa
 		return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
 	}
 	if (request->state == NpAuthRequestState::Aborted) {
+		// request->result = 0;
+		// return 0;
 		request->result = NP_AUTH_ERROR_ABORTED;
 		return NP_AUTH_ERROR_ABORTED;
 	}
+	// request->state  = NpAuthRequestState::Complete;
+	// request->result = 0;
+
+	// return 0;
 	return np_auth_complete_signed_out(request);
 }
 
@@ -1864,9 +1853,15 @@ static int KYTY_SYSV_ABI NpAuthGetIdTokenV3(int req_id, const void* param, void*
 		return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
 	}
 	if (request->state == NpAuthRequestState::Aborted) {
+		// request->result = 0;
+		// return 0;
 		request->result = NP_AUTH_ERROR_ABORTED;
 		return NP_AUTH_ERROR_ABORTED;
 	}
+	// request->state  = NpAuthRequestState::Complete;
+	// request->result = 0;
+
+	// return 0;
 	return np_auth_complete_signed_out(request);
 }
 
@@ -2024,7 +2019,7 @@ static int KYTY_SYSV_ABI NpTrophy2GetGameInfo(int context, int handle,
 		std::memset(details, 0, sizeof(*details));
 		details->num_trophies = 1;
 		details->num_bronze   = 1;
-		NpTrophy2FillTitle(details->title, sizeof(details->title), "Magnus");
+		NpTrophy2FillTitle(details->title, sizeof(details->title), "Kyty");
 	}
 	if (data != nullptr) {
 		std::memset(data, 0, sizeof(*data));
@@ -3000,186 +2995,6 @@ LIB_DEFINE(InitNet_1_NpUniversalDataSystem) {
 
 } // namespace LibNpUniversalDataSystem
 
-namespace LibCes {
-
-LIB_VERSION("Ces", 1, "Ces", 1, 1);
-
-static const uint8_t* KYTY_SYSV_ABI CesRefersUcsProfileCp1252() {
-	PRINT_NAME();
-
-	static const uint8_t profile = 0;
-	return &profile;
-}
-
-static uint32_t CesDecodeUtf8(const uint8_t* utf8, uint32_t utf8max, uint32_t* utf8_len) {
-	if (utf8 == nullptr || utf8max == 0) {
-		if (utf8_len != nullptr) {
-			*utf8_len = 0;
-		}
-		return 0xfffd;
-	}
-
-	const uint8_t c0 = utf8[0];
-	if (c0 < 0x80) {
-		if (utf8_len != nullptr) {
-			*utf8_len = 1;
-		}
-		return c0;
-	}
-	if ((c0 & 0xe0) == 0xc0 && utf8max >= 2 && (utf8[1] & 0xc0) == 0x80) {
-		if (utf8_len != nullptr) {
-			*utf8_len = 2;
-		}
-		return ((c0 & 0x1f) << 6u) | (utf8[1] & 0x3fu);
-	}
-	if ((c0 & 0xf0) == 0xe0 && utf8max >= 3 && (utf8[1] & 0xc0) == 0x80 &&
-	    (utf8[2] & 0xc0) == 0x80) {
-		if (utf8_len != nullptr) {
-			*utf8_len = 3;
-		}
-		return ((c0 & 0x0f) << 12u) | ((utf8[1] & 0x3fu) << 6u) | (utf8[2] & 0x3fu);
-	}
-	if ((c0 & 0xf8) == 0xf0 && utf8max >= 4 && (utf8[1] & 0xc0) == 0x80 &&
-	    (utf8[2] & 0xc0) == 0x80 && (utf8[3] & 0xc0) == 0x80) {
-		if (utf8_len != nullptr) {
-			*utf8_len = 4;
-		}
-		return ((c0 & 0x07) << 18u) | ((utf8[1] & 0x3fu) << 12u) | ((utf8[2] & 0x3fu) << 6u) |
-		       (utf8[3] & 0x3fu);
-	}
-
-	if (utf8_len != nullptr) {
-		*utf8_len = 1;
-	}
-	return 0xfffd;
-}
-
-struct Cp1252Mapping {
-	uint8_t  cp1252;
-	uint32_t unicode;
-};
-
-static constexpr Cp1252Mapping CP1252_EXTENDED_MAP[] = {
-    {0x80, 0x20ac}, {0x82, 0x201a}, {0x83, 0x0192}, {0x84, 0x201e}, {0x85, 0x2026}, {0x86, 0x2020},
-    {0x87, 0x2021}, {0x88, 0x02c6}, {0x89, 0x2030}, {0x8a, 0x0160}, {0x8b, 0x2039}, {0x8c, 0x0152},
-    {0x8e, 0x017d}, {0x91, 0x2018}, {0x92, 0x2019}, {0x93, 0x201c}, {0x94, 0x201d}, {0x95, 0x2022},
-    {0x96, 0x2013}, {0x97, 0x2014}, {0x98, 0x02dc}, {0x99, 0x2122}, {0x9a, 0x0161}, {0x9b, 0x203a},
-    {0x9c, 0x0153}, {0x9e, 0x017e}, {0x9f, 0x0178},
-};
-
-static uint8_t CesUnicodeToCp1252(uint32_t code) {
-	if (code <= 0x7f || (code >= 0xa0 && code <= 0xff)) {
-		return static_cast<uint8_t>(code);
-	}
-
-	for (const auto& map: CP1252_EXTENDED_MAP) {
-		if (map.unicode == code) {
-			return map.cp1252;
-		}
-	}
-	return '?';
-}
-
-static uint32_t CesCp1252ToUnicode(uint8_t sbc) {
-	if (sbc <= 0x7f || sbc >= 0xa0) {
-		return sbc;
-	}
-
-	for (const auto& map: CP1252_EXTENDED_MAP) {
-		if (map.cp1252 == sbc) {
-			return map.unicode;
-		}
-	}
-	return sbc;
-}
-
-static uint32_t CesEncodeUtf8(uint32_t code, uint8_t* utf8, uint32_t utf8max) {
-	uint8_t  tmp[4] {};
-	uint32_t len = 0;
-
-	if (code <= 0x7f) {
-		tmp[0] = static_cast<uint8_t>(code);
-		len    = 1;
-	} else if (code <= 0x7ff) {
-		tmp[0] = static_cast<uint8_t>(0xc0u | ((code >> 6u) & 0x1fu));
-		tmp[1] = static_cast<uint8_t>(0x80u | (code & 0x3fu));
-		len    = 2;
-	} else if (code <= 0xffff) {
-		tmp[0] = static_cast<uint8_t>(0xe0u | ((code >> 12u) & 0x0fu));
-		tmp[1] = static_cast<uint8_t>(0x80u | ((code >> 6u) & 0x3fu));
-		tmp[2] = static_cast<uint8_t>(0x80u | (code & 0x3fu));
-		len    = 3;
-	} else {
-		tmp[0] = static_cast<uint8_t>(0xf0u | ((code >> 18u) & 0x07u));
-		tmp[1] = static_cast<uint8_t>(0x80u | ((code >> 12u) & 0x3fu));
-		tmp[2] = static_cast<uint8_t>(0x80u | ((code >> 6u) & 0x3fu));
-		tmp[3] = static_cast<uint8_t>(0x80u | (code & 0x3fu));
-		len    = 4;
-	}
-
-	if (utf8 != nullptr && utf8max >= len) {
-		std::memcpy(utf8, tmp, len);
-	}
-
-	return len;
-}
-
-static int KYTY_SYSV_ABI CesUtf8ToSbc(const uint8_t* utf8, uint32_t utf8max, uint32_t* utf8_len,
-                                      const uint8_t* profile, uint8_t* sbc) {
-	PRINT_NAME();
-
-	if (sbc == nullptr || profile == nullptr) {
-		return -1;
-	}
-
-	uint32_t   local_len = 0;
-	const auto code      = CesDecodeUtf8(utf8, utf8max, &local_len);
-	if (utf8_len != nullptr) {
-		*utf8_len = local_len;
-	}
-	*sbc = CesUnicodeToCp1252(code);
-
-	return 0;
-}
-
-static int KYTY_SYSV_ABI CesSbcToUtf8(const uint8_t* profile, uint8_t sbc, uint8_t* utf8,
-                                      uint32_t utf8max, uint32_t* utf8_len) {
-	PRINT_NAME();
-
-	if (profile == nullptr || utf8 == nullptr) {
-		return -1;
-	}
-
-	const auto code = CesCp1252ToUnicode(sbc);
-	const auto len  = CesEncodeUtf8(code, utf8, utf8max);
-	if (utf8_len != nullptr) {
-		*utf8_len = len;
-	}
-
-	return utf8max >= len ? 0 : -1;
-}
-
-static int KYTY_SYSV_ABI CesStub(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3) {
-	PRINT_NAME();
-
-	(void)arg0;
-	(void)arg1;
-	(void)arg2;
-	(void)arg3;
-
-	return 0;
-}
-
-LIB_DEFINE(InitNet_1_Ces) {
-	LIB_FUNC("ZiDCxUUGbec", LibCes::CesStub);
-	LIB_FUNC("538bRGc6Zo8", LibCes::CesStub);
-	LIB_FUNC("LPzYZ+FR0BI", LibCes::CesRefersUcsProfileCp1252);
-	LIB_FUNC("3Q1gOWWarcw", LibCes::CesUtf8ToSbc);
-	LIB_FUNC("xTd54EEL1Ao", LibCes::CesSbcToUtf8);
-}
-
-} // namespace LibCes
-
 namespace LibNpGameIntent {
 
 LIB_VERSION("NpGameIntent", 1, "NpGameIntent", 1, 1);
@@ -3293,16 +3108,6 @@ struct NpWebApi2Request {
 static std::map<int64_t, NpWebApi2Request>& NpWebApi2Requests() {
 	static std::map<int64_t, NpWebApi2Request> requests;
 	return requests;
-}
-
-[[maybe_unused]] static std::string NpWebApi2MakeResponse(const NpWebApi2Request& request) {
-	if (request.api_group.find("sessionManager") != std::string::npos ||
-	    request.path.find("sessions") != std::string::npos ||
-	    request.path.find("Sessions") != std::string::npos) {
-		return R"({"gameSessions":[],"playerSessions":[]})";
-	}
-
-	return "{}";
 }
 
 static int KYTY_SYSV_ABI NpWebApi2Initialize(int lib_http_ctx_id, size_t pool_size) {
@@ -3571,6 +3376,9 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventRegisterCallback(int user_context_id,
 }
 
 static void KYTY_SYSV_ABI NpWebApi2CheckTimeout() {
+	// Timeout processing is an internal maintenance tick in Prospero. Requests
+	// complete synchronously in this implementation, so there is no pending
+	// timeout state to advance.
 }
 
 static int KYTY_SYSV_ABI NpWebApi2Terminate(int lib_ctx_id) {
@@ -3914,6 +3722,21 @@ namespace LibGameLiveStreaming {
 
 LIB_VERSION("GameLiveStreaming", 1, "GameLiveStreaming", 1, 1);
 
+constexpr int GAME_LIVE_STREAMING_ERROR_INVALID_PARAM = -2136997886;
+
+struct GameLiveStreamingStatus2 {
+	int32_t  user_id;
+	bool     is_on_air;
+	uint32_t spectator_count;
+	uint32_t text_message_count;
+	uint32_t command_message_count;
+	uint8_t  reserved[52];
+};
+
+static_assert(sizeof(GameLiveStreamingStatus2) == 72);
+static_assert(offsetof(GameLiveStreamingStatus2, is_on_air) == 4);
+static_assert(offsetof(GameLiveStreamingStatus2, spectator_count) == 8);
+
 static int KYTY_SYSV_ABI GameLiveStreamingInitialize(size_t heap_size) {
 	PRINT_NAME();
 
@@ -3928,9 +3751,34 @@ static int KYTY_SYSV_ABI GameLiveStreamingTerminate() {
 	return 0;
 }
 
+static int KYTY_SYSV_ABI GameLiveStreamingGetCurrentStatus2(GameLiveStreamingStatus2* status) {
+	PRINT_NAME();
+
+	if (status == nullptr) {
+		return GAME_LIVE_STREAMING_ERROR_INVALID_PARAM;
+	}
+
+	std::memset(status, 0, sizeof(*status));
+	status->user_id = -1;
+	return OK;
+}
+
+static int KYTY_SYSV_ABI GameLiveStreamingGetSocialFeedbackMessagesCount(int type, uint32_t* count) {
+	PRINT_NAME();
+
+	if (type < 1 || type > 3 || count == nullptr) {
+		return GAME_LIVE_STREAMING_ERROR_INVALID_PARAM;
+	}
+
+	*count = 0;
+	return OK;
+}
+
 LIB_DEFINE(InitPlatform_1_GameLiveStreaming) {
 	LIB_FUNC("kvYEw2lBndk", LibGameLiveStreaming::GameLiveStreamingInitialize);
 	LIB_FUNC("9yK6Fk8mKOQ", LibGameLiveStreaming::GameLiveStreamingTerminate);
+	LIB_FUNC("lK8dLBNp9OE", LibGameLiveStreaming::GameLiveStreamingGetCurrentStatus2);
+	LIB_FUNC("yeQKjHETi40", LibGameLiveStreaming::GameLiveStreamingGetSocialFeedbackMessagesCount);
 }
 
 } // namespace LibGameLiveStreaming
@@ -3983,7 +3831,6 @@ LIB_DEFINE(InitNet_1) {
 	LibNpAuth::InitNet_1_NpAuth(s);
 	LibNpTrophy2::InitNet_1_NpTrophy2(s);
 	LibNpUniversalDataSystem::InitNet_1_NpUniversalDataSystem(s);
-	LibCes::InitNet_1_Ces(s);
 	LibNpGameIntent::InitNet_1_NpGameIntent(s);
 	LibNpWebApi2::InitNet_1_NpWebApi2(s);
 	LibGameUpdate::InitNet_1_GameUpdate(s);

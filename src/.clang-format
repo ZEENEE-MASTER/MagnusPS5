@@ -80,6 +80,10 @@ StatementAttributeLikeMacros:
   - Q_EMIT
 IncludeBlocks:   Regroup
 IncludeCategories:
+  - Regex:           '^"(Kyty)/'
+    Priority:        1
+    SortPriority:    0
+    CaseSensitive:   false
   - Regex:           '^"(Emulator)/'
     Priority:        2
     SortPriority:    0

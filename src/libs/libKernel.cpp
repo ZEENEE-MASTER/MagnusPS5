@@ -3,7 +3,6 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
-#include "common/guestCpu.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
@@ -25,16 +24,15 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -44,9 +42,11 @@
 #include <windows.h>
 #elif defined(__APPLE__)
 #include <csignal>
+#include <pthread.h>
 #include <sys/ucontext.h>
 #else
 #include <csignal>
+#include <pthread.h>
 #include <ucontext.h>
 #endif
 
@@ -68,10 +68,6 @@ namespace LibKernel {
 using KernelModule                   = int32_t;
 using get_thread_atexit_count_func_t = KYTY_SYSV_ABI int (*)(KernelModule);
 using thread_atexit_report_func_t    = KYTY_SYSV_ABI void (*)(KernelModule);
-
-static uint32_t sha1_rol(uint32_t value, uint32_t bits) {
-	return (value << bits) | (value >> (32u - bits));
-}
 
 static std::array<uint8_t, 20> sha1_digest(const uint8_t* data, size_t size) {
 	uint32_t h0 = 0x67452301u;
@@ -100,7 +96,7 @@ static std::array<uint8_t, 20> sha1_digest(const uint8_t* data, size_t size) {
 			       (static_cast<uint32_t>(msg[j + 2]) << 8u) | static_cast<uint32_t>(msg[j + 3]);
 		}
 		for (int i = 16; i < 80; i++) {
-			w[i] = sha1_rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+			w[i] = std::rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
 		}
 
 		uint32_t a = h0;
@@ -126,10 +122,10 @@ static std::array<uint8_t, 20> sha1_digest(const uint8_t* data, size_t size) {
 				k = 0xca62c1d6u;
 			}
 
-			const auto temp = sha1_rol(a, 5) + f + e + k + w[i];
+			const auto temp = std::rotl(a, 5) + f + e + k + w[i];
 			e               = d;
 			d               = c;
-			c               = sha1_rol(b, 30);
+			c               = std::rotl(b, 30);
 			b               = a;
 			a               = temp;
 		}
@@ -178,40 +174,33 @@ static std::string kernel_symbol_to_nid(const char* symbol) {
 }
 
 static const Loader::SymbolRecord* kernel_find_export_symbol(const Loader::SymbolDatabase* symbols,
-                                                             const char*                   symbol,
-                                                             Loader::SymbolType*           type) {
+                                                             const char*                   symbol) {
 	EXIT_IF(symbols == nullptr);
 	EXIT_IF(symbol == nullptr);
 
 	const auto nid = kernel_symbol_to_nid(symbol);
 
 	if (const auto* record = symbols->FindByNid(nid, Loader::SymbolType::Func); record != nullptr) {
-		*type = Loader::SymbolType::Func;
 		return record;
 	}
 	if (const auto* record = symbols->FindByNid(nid, Loader::SymbolType::Object);
 	    record != nullptr) {
-		*type = Loader::SymbolType::Object;
 		return record;
 	}
 	if (const auto* record = symbols->FindByNid(nid, Loader::SymbolType::NoType);
 	    record != nullptr) {
-		*type = Loader::SymbolType::NoType;
 		return record;
 	}
 
 	const auto symbol_name = std::string(symbol);
 	if (const auto* record = symbols->FindByName(symbol_name, Loader::SymbolType::Func);
 	    record != nullptr) {
-		*type = Loader::SymbolType::Func;
 		return record;
 	}
 	if (const auto* record = symbols->FindByName(symbol_name, Loader::SymbolType::Object);
 	    record != nullptr) {
-		*type = Loader::SymbolType::Object;
 		return record;
 	}
-	*type = Loader::SymbolType::NoType;
 	return symbols->FindByName(symbol_name, Loader::SymbolType::NoType);
 }
 
@@ -265,12 +254,9 @@ int KYTY_SYSV_ABI KernelDlsym(KernelModule handle, const char* symbol, void** ad
 		return KERNEL_ERROR_ESRCH;
 	}
 
-	Loader::SymbolType type = Loader::SymbolType::Unknown;
-	const auto* record = kernel_find_export_symbol(program->export_symbols.get(), symbol, &type);
+	const auto* record = kernel_find_export_symbol(program->export_symbols.get(), symbol);
 	if (record != nullptr) {
-		*addr = reinterpret_cast<void*>(type == Loader::SymbolType::Func
-		                                    ? Loader::GuestCallable(record->vaddr)
-		                                    : record->vaddr);
+		*addr = reinterpret_cast<void*>(record->vaddr);
 		if (index < 32 || (index % 600) == 0) {
 			LOGF("\t resolved = 0x%016" PRIx64 " (%s)\n", record->vaddr, record->name.c_str());
 		}
@@ -278,8 +264,7 @@ int KYTY_SYSV_ABI KernelDlsym(KernelModule handle, const char* symbol, void** ad
 	}
 
 	if (handle == 0 && std::strcmp(symbol, "scriptingGetMem") == 0) {
-		*addr = reinterpret_cast<void*>(
-		    Loader::GuestCallable(reinterpret_cast<uint64_t>(&KernelApplicationHeapGetMem)));
+		*addr = reinterpret_cast<void*>(&KernelApplicationHeapGetMem);
 		if (index < 32 || (index % 600) == 0) {
 			LOGF("\t resolved = 0x%016" PRIx64 " (application heap scriptingGetMem)\n",
 			     reinterpret_cast<uint64_t>(*addr));
@@ -476,19 +461,9 @@ static void dump_stack_chk_fail_context(uint64_t caller, uint64_t rsp) {
 static KYTY_SYSV_ABI void stack_chk_fail() {
 	PRINT_NAME();
 
-#if defined(__x86_64__) || defined(_M_X64)
 	uint64_t rsp = 0;
 	asm volatile("movq %%rsp, %0" : "=r"(rsp));
 	dump_stack_chk_fail_context(reinterpret_cast<uint64_t>(__builtin_return_address(0)), rsp);
-#else
-	Common::GuestCpu::CallFrame frame {};
-	if (Common::GuestCpu::IsInstalled() && Common::GuestCpu::Get().CurrentCallFrame != nullptr &&
-	    Common::GuestCpu::Get().CurrentCallFrame(&frame)) {
-		dump_stack_chk_fail_context(frame.return_address, frame.stack_pointer);
-	} else {
-		LOGF("stack_chk_fail: no guest call frame, the CPU layer supplied none\n");
-	}
-#endif
 
 	EXIT("stack fail!!!");
 }
@@ -534,13 +509,18 @@ bool KernelIsDispatchingSignalOnCurrentThread() {
 	return g_dispatching_signal_handler;
 }
 
-static void QueuePendingSignal(Pthread thread, int signum) {
-	PthreadQueuePendingSignal(thread, signum);
-}
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+static void WaitForSignalDispatch(Pthread thread, int signum) {
+	constexpr auto DISPATCH_WAIT_STEP = std::chrono::microseconds(1000);
+	constexpr auto DISPATCH_WAIT_MAX  = std::chrono::milliseconds(2);
 
-static bool TakePendingSignal(Pthread thread, int signum) {
-	return PthreadTakePendingSignal(thread, signum);
+	auto waited = std::chrono::microseconds(0);
+	while (PthreadHasPendingSignal(thread, signum) && waited < DISPATCH_WAIT_MAX) {
+		Common::Thread::SleepMicro(DISPATCH_WAIT_STEP.count());
+		waited += DISPATCH_WAIT_STEP;
+	}
 }
+#endif
 
 struct SignalMcontext {
 	uint64_t mc_onstack;
@@ -650,6 +630,7 @@ static SignalUcontext CreateSignalUcontext(
 	ctx.uc_mcontext.mc_rip = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 
 #if defined(__x86_64__)
+	// Capture the remaining guest-visible registers.
 	uint64_t rax = 0;
 	uint64_t rbx = 0;
 	uint64_t rcx = 0;
@@ -717,6 +698,48 @@ static SignalUcontext CreateSignalUcontext(
 	ctx.uc_mcontext.mc_ss     = ss;
 #endif
 #endif
+
+	return ctx;
+}
+
+static SignalUcontext CreateCurrentGuestCallSignalUcontext(uint64_t rip) {
+	auto ctx = CreateSignalUcontext();
+
+	uint64_t rsp = 0;
+	uint64_t rbp = 0;
+	uint64_t rbx = 0;
+	uint64_t r12 = 0;
+	uint64_t r13 = 0;
+	uint64_t r14 = 0;
+	uint64_t r15 = 0;
+	asm volatile("movq %%rsp, %0\n\t"
+	             "movq %%rbp, %1\n\t"
+	             "movq %%rbx, %2\n\t"
+	             "movq %%r12, %3\n\t"
+	             "movq %%r13, %4\n\t"
+	             "movq %%r14, %5\n\t"
+	             "movq %%r15, %6\n\t"
+	             : "=r"(rsp), "=r"(rbp), "=r"(rbx), "=r"(r12), "=r"(r13), "=r"(r14), "=r"(r15)
+	             :
+	             : "memory");
+
+	ctx.uc_mcontext.mc_rax = 0;
+	ctx.uc_mcontext.mc_rcx = 0;
+	ctx.uc_mcontext.mc_rdx = 0;
+	ctx.uc_mcontext.mc_rsi = 0;
+	ctx.uc_mcontext.mc_rdi = 0;
+	ctx.uc_mcontext.mc_r8  = 0;
+	ctx.uc_mcontext.mc_r9  = 0;
+	ctx.uc_mcontext.mc_r10 = 0;
+	ctx.uc_mcontext.mc_r11 = 0;
+	ctx.uc_mcontext.mc_rbx = rbx;
+	ctx.uc_mcontext.mc_rbp = rbp;
+	ctx.uc_mcontext.mc_rsp = rsp;
+	ctx.uc_mcontext.mc_r12 = r12;
+	ctx.uc_mcontext.mc_r13 = r13;
+	ctx.uc_mcontext.mc_r14 = r14;
+	ctx.uc_mcontext.mc_r15 = r15;
+	ctx.uc_mcontext.mc_rip = rip;
 
 	return ctx;
 }
@@ -809,27 +832,6 @@ static void ApplySignalUcontext(CONTEXT* dst_ctx, const SignalUcontext& src_ctx)
 }
 #endif
 
-static void RunGuestSignalHandler(exception_handler_func_t handler, int signum,
-                                  SignalUcontext* ctx) {
-	const uint64_t args[2] = {static_cast<uint64_t>(static_cast<uint32_t>(signum)),
-	                          reinterpret_cast<uint64_t>(ctx)};
-	uint64_t       guest_result = 0;
-	Common::GuestCpu::CallFrame frame {};
-	const auto& cpu = Common::GuestCpu::Get();
-	const bool active_frame = cpu.CurrentCallFrame != nullptr && cpu.CurrentCallFrame(&frame);
-	uint64_t stack_addr = 0;
-	uint64_t stack_size = 0;
-	const bool has_stack = PthreadGetGuestStack(PthreadSelfOrNull(), &stack_addr, &stack_size);
-	const bool called = !active_frame && has_stack
-	                        ? Loader::CallGuestViaOnStack(reinterpret_cast<uint64_t>(handler), args, 2,
-	                                                      stack_addr + stack_size, &guest_result)
-	                        : Loader::CallGuestVia(reinterpret_cast<uint64_t>(handler), args, 2,
-	                                               &guest_result);
-	if (!called) {
-		handler(signum, ctx);
-	}
-}
-
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && defined(__x86_64__)
 
 static SignalUcontext CreateSignalUcontextFromHost(const ucontext_t* host_ctx) {
@@ -887,6 +889,7 @@ static SignalUcontext CreateSignalUcontextFromHost(const ucontext_t* host_ctx) {
 	ctx.uc_mcontext.mc_rsp    = static_cast<uint64_t>(gregs[REG_RSP]);
 	ctx.uc_mcontext.mc_rflags = static_cast<uint64_t>(gregs[REG_EFL]);
 
+	// Linux packs cs/gs/fs into one greg.
 	const auto csgsfs      = static_cast<uint64_t>(gregs[REG_CSGSFS]);
 	ctx.uc_mcontext.mc_cs  = csgsfs & 0xffffu;
 	ctx.uc_mcontext.mc_gs  = static_cast<uint16_t>((csgsfs >> 16u) & 0xffffu);
@@ -923,6 +926,7 @@ static void ApplySignalUcontextToHost(ucontext_t* dst_ctx, const SignalUcontext&
 	ss.__rip    = src_ctx.uc_mcontext.mc_rip;
 	ss.__rsp    = src_ctx.uc_mcontext.mc_rsp;
 	ss.__rflags = src_ctx.uc_mcontext.mc_rflags;
+	// Segment selectors are left untouched; XNU validates them on sigreturn.
 #else
 	auto* gregs = dst_ctx->uc_mcontext.gregs;
 
@@ -945,11 +949,14 @@ static void ApplySignalUcontextToHost(ucontext_t* dst_ctx, const SignalUcontext&
 	gregs[REG_RSP] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_rsp);
 	gregs[REG_EFL] = static_cast<greg_t>(src_ctx.uc_mcontext.mc_rflags);
 
+	// The kernel validates packed segment selectors on sigreturn.
 #endif
 }
 
 static int SignalDispatchHostSignal() {
 #if defined(__APPLE__)
+	// macOS has no realtime signals; SIGUSR1 is otherwise unused on the host side (the
+	// guest's SIGUSR1 is an emulated signal number, not a host registration).
 	static const int host_signal = SIGUSR1;
 #else
 	static const int host_signal = SIGRTMIN + 3;
@@ -967,7 +974,7 @@ static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
 	auto* host_ctx = static_cast<ucontext_t*>(native_context);
 
 	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
-		if (!TakePendingSignal(current, signum)) {
+		if (!PthreadTakePendingSignal(current, signum)) {
 			continue;
 		}
 
@@ -976,11 +983,12 @@ static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
 			SignalDispatchScope scope;
 			auto                ctx = CreateSignalUcontextFromHost(host_ctx);
 			if (IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
-				RunGuestSignalHandler(handler, signum, &ctx);
+				handler(signum, &ctx);
 				ApplySignalUcontextToHost(host_ctx, ctx);
 			} else {
+				// Do not expose or restore a host frame.
 				SanitizeNonGuestSignalUcontext(&ctx, current);
-				RunGuestSignalHandler(handler, signum, &ctx);
+				handler(signum, &ctx);
 			}
 		}
 		return;
@@ -1001,21 +1009,21 @@ static bool EnsureHostSignalDispatchInstalled() {
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-enum NtQueueUserApcFlags : ULONG_PTR {
-	NtQueueUserApcFlagsNone            = 0,
-	NtQueueUserApcFlagsSpecialUserApc  = 1,
-	NtQueueUserApcFlagsCallbackContext = 0x00010000,
-	NtQueueUserApcFlagsMaxValue        = 2,
+enum KytyQueueUserApcFlags : ULONG_PTR {
+	KytyQueueUserApcFlagsNone            = 0,
+	KytyQueueUserApcFlagsSpecialUserApc  = 1,
+	KytyQueueUserApcFlagsCallbackContext = 0x00010000,
+	KytyQueueUserApcFlagsMaxValue        = 2,
 };
 
-union NtUserApcOption {
+union KytyUserApcOption {
 	ULONG_PTR UserApcFlags;
 	HANDLE    MemoryReserveHandle;
 };
 
-using NtPsApcRoutine = void (*)(void* apc_arg1, void* apc_arg2, void* apc_arg3, PCONTEXT context);
-using NtQueueApcThreadExFunc = uint64_t(WINAPI*)(HANDLE thread, NtUserApcOption option,
-                                                 NtPsApcRoutine routine, void* arg1, void* arg2,
+using KytyPsApcRoutine = void (*)(void* apc_arg1, void* apc_arg2, void* apc_arg3, PCONTEXT context);
+using NtQueueApcThreadExFunc = uint64_t(WINAPI*)(HANDLE thread, KytyUserApcOption option,
+                                                 KytyPsApcRoutine routine, void* arg1, void* arg2,
                                                  void* arg3);
 
 static NtQueueApcThreadExFunc GetNtQueueApcThreadEx() {
@@ -1027,7 +1035,7 @@ static NtQueueApcThreadExFunc GetNtQueueApcThreadEx() {
 static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT context) {
 	auto*      thread = static_cast<Pthread>(arg1);
 	const auto signum = static_cast<int>(reinterpret_cast<intptr_t>(arg2));
-	if (!TakePendingSignal(thread, signum)) {
+	if (!PthreadTakePendingSignal(thread, signum)) {
 		return;
 	}
 
@@ -1041,12 +1049,12 @@ static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT co
 			std::thread([thread, signum, handler, ctx]() mutable {
 				SignalDispatchScope helper_scope;
 				auto*               previous_self = PthreadSwapSelfForSignal(thread);
-				RunGuestSignalHandler(handler, signum, &ctx);
+				handler(signum, &ctx);
 				PthreadSwapSelfForSignal(previous_self);
 			}).detach();
 			return;
 		}
-		RunGuestSignalHandler(handler, signum, &ctx);
+		handler(signum, &ctx);
 		if (guest_context) {
 			ApplySignalUcontext(context, ctx);
 		}
@@ -1062,7 +1070,7 @@ void KernelDispatchPendingSignalForCurrentThread() {
 	}
 
 	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
-		if (!TakePendingSignal(current, signum)) {
+		if (!PthreadTakePendingSignal(current, signum)) {
 			continue;
 		}
 
@@ -1071,20 +1079,7 @@ void KernelDispatchPendingSignalForCurrentThread() {
 			SignalDispatchScope scope;
 			auto                ctx = CreateSignalUcontext();
 			SanitizeNonGuestSignalUcontext(&ctx, current);
-#if defined(__APPLE__)
-			Common::GuestCpu::CallFrame frame {};
-			const auto& cpu = Common::GuestCpu::Get();
-			if (cpu.CurrentCallFrame != nullptr && cpu.CurrentCallFrame(&frame)) {
-				std::thread([current, signum, handler, ctx]() mutable {
-					SignalDispatchScope helper_scope;
-					auto* previous_self = PthreadSwapSelfForSignal(current);
-					RunGuestSignalHandler(handler, signum, &ctx);
-					PthreadSwapSelfForSignal(previous_self);
-				}).detach();
-				return;
-			}
-#endif
-			RunGuestSignalHandler(handler, signum, &ctx);
+			handler(signum, &ctx);
 		}
 		return;
 	}
@@ -1140,7 +1135,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			SignalDispatchScope scope;
 			auto                ctx = CreateCurrentGuestCallSignalUcontext(
 			    reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-			RunGuestSignalHandler(handler, signum, &ctx);
+			handler(signum, &ctx);
 			return OK;
 		}
 		if (nt_queue_apc_thread_ex == nullptr) {
@@ -1153,16 +1148,16 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			return KERNEL_ERROR_EINVAL;
 		}
 
-		QueuePendingSignal(thread, signum);
-		NtUserApcOption option {};
-		option.UserApcFlags = NtQueueUserApcFlagsSpecialUserApc;
+		PthreadQueuePendingSignal(thread, signum);
+		KytyUserApcOption option {};
+		option.UserApcFlags = KytyQueueUserApcFlagsSpecialUserApc;
 
 		const auto status =
 		    nt_queue_apc_thread_ex(target_thread, option, SignalApcHandler, thread,
 		                           reinterpret_cast<void*>(static_cast<intptr_t>(signum)), nullptr);
 
 		if (status != 0) {
-			TakePendingSignal(thread, signum);
+			PthreadTakePendingSignal(thread, signum);
 			CloseHandle(target_thread);
 			LOGF("\t NtQueueApcThreadEx failed: target_os_thread=%" PRIu64 ", status=0x%016" PRIx64
 			     "\n",
@@ -1170,16 +1165,16 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			return KERNEL_ERROR_EINVAL;
 		}
 
-		Common::CondVar::SignalThread(PthreadGetUniqueId(thread));
 		PthreadWakeForSignal(thread);
 		CloseHandle(target_thread);
 		return OK;
 #elif defined(__x86_64__)
+		// Deliver on the target thread.
 		if (thread == PthreadSelfOrNull()) {
 			SignalDispatchScope scope;
 			auto                ctx = CreateCurrentGuestCallSignalUcontext(
 			    reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-			RunGuestSignalHandler(handler, signum, &ctx);
+			handler(signum, &ctx);
 			return OK;
 		}
 
@@ -1187,28 +1182,19 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			return KERNEL_ERROR_EINVAL;
 		}
 
-		QueuePendingSignal(thread, signum);
+		PthreadQueuePendingSignal(thread, signum);
 		if (!PthreadKillHost(thread, SignalDispatchHostSignal())) {
-			TakePendingSignal(thread, signum);
+			PthreadTakePendingSignal(thread, signum);
 			LOGF("\t pthread_kill failed for target thread\n");
 			return KERNEL_ERROR_EINVAL;
 		}
 
-		Common::CondVar::SignalThread(PthreadGetUniqueId(thread));
 		PthreadWakeForSignal(thread);
 		WaitForSignalDispatch(thread, signum);
 		return OK;
 #else
-		if (thread == PthreadSelfOrNull()) {
-			SignalDispatchScope scope;
-			auto ctx = CreateSignalUcontext();
-			SanitizeNonGuestSignalUcontext(&ctx, thread);
-			RunGuestSignalHandler(handler, signum, &ctx);
-			return OK;
-		}
-		QueuePendingSignal(thread, signum);
-		Common::CondVar::SignalThread(PthreadGetUniqueId(thread));
-		PthreadWakeForSignal(thread);
+		auto ctx = CreateSignalUcontext();
+		handler(signum, &ctx);
 #endif
 	}
 
@@ -1337,6 +1323,15 @@ static int KYTY_SYSV_ABI KernelIsTrinityMode() {
 	}
 
 	return 0;
+}
+
+static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
+	PRINT_NAME();
+
+	*mode    = 2; // PS5 Base
+	*submode = 0; // None
+	LOGF("\t mode = %d, submode = %d\n", *mode, *submode);
+	return OK;
 }
 
 static int KYTY_SYSV_ABI KernelFsync(int fd) {
@@ -1514,6 +1509,7 @@ static bool DecodeEhFramePointer(const uint8_t* data, const uint8_t* end, uint8_
 	return true;
 }
 
+// Kyty does not create guest signal-return trampoline frames.
 int KYTY_SYSV_ABI KernelIsSignalReturn(uint64_t /*pc*/) {
 	return 0;
 }
@@ -1539,9 +1535,12 @@ int KYTY_SYSV_ABI KernelGetModuleInfoForUnwind(uint64_t addr, int flags,
 	auto* program = rt->FindProgramByAddr(addr);
 	if (program == nullptr || program->elf == nullptr) {
 		if (addr < 0x800000000ull) {
+			// TODO(unwind): guest unwinding can reach a Kyty host return address below the guest VA
+			// range. Report a synthetic boundary with no unwind tables so libc stops cleanly
+			// instead of raising.
 			std::memset(info, 0, sizeof(ModuleInfoForUnwind));
 			info->st_size = sizeof(ModuleInfoForUnwind);
-			std::snprintf(info->name, sizeof(info->name), "%s", "MagnusHostBoundary");
+			std::snprintf(info->name, sizeof(info->name), "%s", "KytyHostBoundary");
 			info->seg0_addr = addr & ~0xfffffull;
 			info->seg0_size = 0x100000;
 			return OK;
@@ -2108,28 +2107,37 @@ int KYTY_SYSV_ABI KernelSyncOnAddressWake(volatile void* address, int32_t count)
 	return LibKernel::SyncOnAddress::Wake(address, count);
 }
 
-int KYTY_SYSV_ABI unlink(const char* path) {
-	PRINT_NAME();
+int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
+                           void* uaddr, const void* timeout) {
+	constexpr int UMTX_OP_WAIT = 2;
+	constexpr int UMTX_OP_WAKE = 3;
 
-	return POSIX_CALL(LibKernel::FileSystem::KernelUnlink(path));
-}
+	EXIT_NOT_IMPLEMENTED(uaddr != nullptr);
 
-int KYTY_SYSV_ABI rename(const char* from, const char* to) {
-	PRINT_NAME();
-
-	return POSIX_CALL(LibKernel::FileSystem::KernelRename(from, to));
-}
-
-int KYTY_SYSV_ABI rmdir(const char* path) {
-	PRINT_NAME();
-
-	return POSIX_CALL(LibKernel::FileSystem::KernelRmdir(path));
-}
-
-int KYTY_SYSV_ABI fsync(int fd) {
-	PRINT_NAME();
-
-	return POSIX_CALL(LibKernel::KernelFsync(fd));
+	switch (operation) {
+		case UMTX_OP_WAIT:
+			if (timeout != nullptr) {
+				LibKernel::KernelTimespec duration {};
+				std::memcpy(&duration, timeout, sizeof(duration));
+				if (duration.tv_sec < 0 || duration.tv_nsec < 0 || duration.tv_nsec >= 1000000000) {
+					*GetErrorAddr() = POSIX_EINVAL;
+					return -1;
+				}
+				const auto max_ns = std::chrono::nanoseconds::max().count();
+				const auto timeout_ns = duration.tv_sec > (max_ns - duration.tv_nsec) / 1000000000
+				                            ? max_ns
+				                            : duration.tv_sec * 1000000000 + duration.tv_nsec;
+				return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(
+				    static_cast<volatile uint64_t*>(address), value, std::chrono::nanoseconds(timeout_ns),
+				    LibKernel::KernelDispatchPendingSignalForCurrentThread));
+			}
+			return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(
+			    static_cast<volatile uint64_t*>(address), value, nullptr,
+			    LibKernel::KernelDispatchPendingSignalForCurrentThread));
+		case UMTX_OP_WAKE:
+			return POSIX_CALL(LibKernel::SyncOnAddress::Wake(address, static_cast<int32_t>(value)));
+		default: EXIT("Unsupported _umtx_op operation: %d\n", operation);
+	}
 }
 
 LIB_DEFINE(InitLibKernel_1_Posix) {
@@ -2141,13 +2149,6 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("yS8U2TGCe1A", nanosleep);
 	LIB_FUNC("E6ao34wPw+U", stat);
 	LIB_FUNC("JGMio+21L4c", mkdir);
-	LIB_FUNC("wuCroIGjt2g", LibKernel::open);
-	LIB_FUNC("bY-PO6JhzhQ", LibKernel::close);
-	LIB_FUNC("FN4gaPmuFV8", LibKernel::write);
-	LIB_FUNC("VAzswvTOCzI", Posix::unlink);
-	LIB_FUNC("NN01qLRhiqU", Posix::rename);
-	LIB_FUNC("c7ZnT7V1B98", Posix::rmdir);
-	LIB_FUNC("juWbTNM+8hw", Posix::fsync);
 	LIB_FUNC("ih4CD9-gghM", Posix::ftruncate);
 	LIB_FUNC("pDuPEf3m4fI", Posix::sem_init);
 	LIB_FUNC("cDW233RAwWo", Posix::sem_destroy);
@@ -2352,132 +2353,71 @@ static bool FiberIsValid(const FiberObject* fiber) {
 	       fiber->magic_end == FIBER_MAGIC_END;
 }
 
-static thread_local FiberObject*                  g_current_fiber       = nullptr;
-static thread_local FiberObject*                  g_thread_return_fiber = nullptr;
-static thread_local FiberObject*                  g_starting_fiber      = nullptr;
-static thread_local FiberObject*                  g_pending_idle_fiber  = nullptr;
-static thread_local FiberCpuContext               g_thread_fiber_context {};
-static std::mutex                                 g_fiber_owner_mutex;
-static std::unordered_map<FiberObject*, uint64_t> g_fiber_owner_thread;
-static std::unordered_map<uint64_t, FiberObject*> g_fiber_current_by_thread;
+struct FiberThreadContext {
+	FiberObject*    current_fiber;
+	FiberObject*    returned_fiber;
+	FiberObject*    pending_idle_fiber;
+	FiberCpuContext cpu_context;
+};
+
+static const auto g_fiber_context_key = [] {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const auto key = TlsAlloc();
+	if (key == TLS_OUT_OF_INDEXES) {
+		std::abort();
+	}
+#else
+	pthread_key_t key;
+	if (pthread_key_create(&key, nullptr) != 0) {
+		std::abort();
+	}
+#endif
+	return key;
+}();
+
+// Native lookup must stay fresh when a fiber resumes on another host thread.
+static FiberThreadContext* FiberGetThreadContext() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return static_cast<FiberThreadContext*>(TlsGetValue(g_fiber_context_key));
+#else
+	return static_cast<FiberThreadContext*>(pthread_getspecific(g_fiber_context_key));
+#endif
+}
+
+static void FiberSetThreadContext(FiberThreadContext* context) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (TlsSetValue(g_fiber_context_key, context) == 0) {
+#else
+	if (pthread_setspecific(g_fiber_context_key, context) != 0) {
+#endif
+		std::abort();
+	}
+}
 
 static uint32_t FiberLoadState(const FiberObject* fiber) {
 	auto& state = const_cast<uint32_t&>(fiber->state);
 	return std::atomic_ref<uint32_t>(state).load(std::memory_order_acquire);
 }
 
-static uint64_t FiberCurrentHostThreadId() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	return static_cast<uint64_t>(::GetCurrentThreadId());
-#else
-	return std::hash<std::thread::id> {}(std::this_thread::get_id());
-#endif
-}
-
-static void FiberSetOwner(FiberObject* fiber) {
-	std::lock_guard lock(g_fiber_owner_mutex);
-	g_fiber_owner_thread[fiber] = FiberCurrentHostThreadId();
-}
-
-static void FiberClearOwner(FiberObject* fiber) {
-	std::lock_guard lock(g_fiber_owner_mutex);
-	g_fiber_owner_thread.erase(fiber);
-}
-
-static uint64_t FiberGetOwner(FiberObject* fiber) {
-	std::lock_guard lock(g_fiber_owner_mutex);
-	auto            it = g_fiber_owner_thread.find(fiber);
-	return it != g_fiber_owner_thread.end() ? it->second : 0;
-}
-
-static void FiberSetCurrentFiber(FiberObject* fiber) {
-	g_current_fiber = fiber;
-
-	std::lock_guard lock(g_fiber_owner_mutex);
-	const auto      thread_id = FiberCurrentHostThreadId();
-	if (fiber != nullptr) {
-		g_fiber_current_by_thread[thread_id] = fiber;
-	} else {
-		g_fiber_current_by_thread.erase(thread_id);
-	}
-}
-
 static void FiberStoreState(FiberObject* fiber, uint32_t state) {
 	std::atomic_ref<uint32_t>(fiber->state).store(state, std::memory_order_release);
-	if (state == FIBER_STATE_RUNNING) {
-		FiberSetOwner(fiber);
-	} else {
-		FiberClearOwner(fiber);
-	}
 }
 
-static void FiberDeferIdle(FiberObject* fiber) {
-	g_pending_idle_fiber = fiber;
-}
-
-static void FiberCommitDeferredIdle() {
-	auto* fiber          = g_pending_idle_fiber;
-	g_pending_idle_fiber = nullptr;
+static void FiberCompleteSwitch(FiberObject* current) {
+	auto* context = FiberGetThreadContext();
+	context->current_fiber = current;
+	// Only publish IDLE after switching away from the departing fiber's stack.
+	auto* fiber = context->pending_idle_fiber;
+	context->pending_idle_fiber = nullptr;
 	if (fiber != nullptr) {
 		FiberStoreState(fiber, FIBER_STATE_IDLE);
 	}
 }
 
 static bool FiberCompareExchangeState(FiberObject* fiber, uint32_t expected, uint32_t desired) {
-	const bool ok = std::atomic_ref<uint32_t>(fiber->state)
-	                    .compare_exchange_strong(expected, desired, std::memory_order_acq_rel,
-	                                             std::memory_order_acquire);
-	if (ok) {
-		if (desired == FIBER_STATE_RUNNING) {
-			FiberSetOwner(fiber);
-		} else {
-			FiberClearOwner(fiber);
-		}
-	}
-	return ok;
-}
-
-static bool FiberWaitAndEnterRunning(FiberObject* fiber, uint32_t* observed_state) {
-	const auto start = std::chrono::steady_clock::now();
-	uint32_t   spin  = 0;
-	auto&      state = fiber->state;
-	auto       ref   = std::atomic_ref<uint32_t>(state);
-
-	for (;;) {
-		uint32_t expected = FIBER_STATE_IDLE;
-		if (ref.compare_exchange_strong(expected, FIBER_STATE_RUNNING, std::memory_order_acq_rel,
-		                                std::memory_order_acquire)) {
-			FiberSetOwner(fiber);
-			return true;
-		}
-		if (observed_state != nullptr) {
-			*observed_state = expected;
-		}
-		if (expected != FIBER_STATE_RUNNING) {
-			return false;
-		}
-		if (std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(5)) {
-			return false;
-		}
-		if (spin++ < 64) {
-			std::this_thread::yield();
-		} else {
-			std::this_thread::sleep_for(std::chrono::microseconds(100));
-		}
-	}
-}
-
-static bool FiberRepairStaleRunningOnThisThread(FiberObject* fiber, uint32_t observed_state) {
-	if (observed_state != FIBER_STATE_RUNNING || fiber == g_current_fiber) {
-		return false;
-	}
-
-	const auto owner = FiberGetOwner(fiber);
-	if (owner != 0) {
-		return false;
-	}
-
-	return FiberCompareExchangeState(fiber, FIBER_STATE_RUNNING, FIBER_STATE_IDLE);
+	return std::atomic_ref<uint32_t>(fiber->state)
+	    .compare_exchange_strong(expected, desired, std::memory_order_acq_rel,
+	                             std::memory_order_acquire);
 }
 
 static void FiberSetContextValid(FiberObject* fiber, bool valid) {
@@ -2486,47 +2426,40 @@ static void FiberSetContextValid(FiberObject* fiber, bool valid) {
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
-__attribute__((noinline, returns_twice)) static int FiberSaveContext(FiberCpuContext* ctx) {
-	int ret = 0;
-	asm volatile("movq %[ctx], %%r10\n\t"
-	             "movq %%rbx, 0(%%r10)\n\t"
-	             "movq %%rbp, 8(%%r10)\n\t"
-	             "movq %%rdi, 16(%%r10)\n\t"
-	             "movq %%rsi, 24(%%r10)\n\t"
-	             "movq %%r12, 32(%%r10)\n\t"
-	             "movq %%r13, 40(%%r10)\n\t"
-	             "movq %%r14, 48(%%r10)\n\t"
-	             "movq %%r15, 56(%%r10)\n\t"
-	             "leaq 8(%%rsp), %%r11\n\t"
-	             "movq %%r11, 64(%%r10)\n\t"
-	             "movq (%%rsp), %%r11\n\t"
-	             "movq %%r11, 72(%%r10)\n\t"
-	             "xorl %%eax, %%eax\n\t"
-	             : "=a"(ret)
-	             : [ctx] "r"(ctx)
-	             : "memory", "r10", "r11");
-	return ret;
+[[gnu::naked,
+  gnu::returns_twice]] static KYTY_SYSV_ABI int FiberSaveContext(FiberCpuContext* /*ctx*/) {
+	asm volatile("movq %rdi, %r10\n\t"
+	             "movq %rbx, 0(%r10)\n\t"
+	             "movq %rbp, 8(%r10)\n\t"
+	             "movq %rdi, 16(%r10)\n\t"
+	             "movq %rsi, 24(%r10)\n\t"
+	             "movq %r12, 32(%r10)\n\t"
+	             "movq %r13, 40(%r10)\n\t"
+	             "movq %r14, 48(%r10)\n\t"
+	             "movq %r15, 56(%r10)\n\t"
+	             "leaq 8(%rsp), %r11\n\t"
+	             "movq %r11, 64(%r10)\n\t"
+	             "movq (%rsp), %r11\n\t"
+	             "movq %r11, 72(%r10)\n\t"
+	             "xorl %eax, %eax\n\t"
+	             "retq\n");
 }
 
-__attribute__((noreturn, noinline)) static void FiberRestoreContext(FiberCpuContext* ctx,
-                                                                    uint64_t         ret) {
-	asm volatile("movq %[ctx], %%r10\n\t"
-	             "movq 72(%%r10), %%r11\n\t"
-	             "movq 0(%%r10), %%rbx\n\t"
-	             "movq 8(%%r10), %%rbp\n\t"
-	             "movq 16(%%r10), %%rdi\n\t"
-	             "movq 24(%%r10), %%rsi\n\t"
-	             "movq 32(%%r10), %%r12\n\t"
-	             "movq 40(%%r10), %%r13\n\t"
-	             "movq 48(%%r10), %%r14\n\t"
-	             "movq 56(%%r10), %%r15\n\t"
-	             "movq 64(%%r10), %%rsp\n\t"
-	             "movq %[ret], %%rax\n\t"
-	             "jmp *%%r11\n\t"
-	             :
-	             : [ctx] "r"(ctx), [ret] "r"(ret)
-	             : "memory", "rax", "r10", "r11");
-	__builtin_unreachable();
+[[gnu::naked, gnu::noreturn]] static KYTY_SYSV_ABI void
+FiberRestoreContext(FiberCpuContext* /*ctx*/, uint64_t /*ret*/) {
+	asm volatile("movq %rdi, %r10\n\t"
+	             "movq %rsi, %rax\n\t"
+	             "movq 72(%r10), %r11\n\t"
+	             "movq 0(%r10), %rbx\n\t"
+	             "movq 8(%r10), %rbp\n\t"
+	             "movq 16(%r10), %rdi\n\t"
+	             "movq 24(%r10), %rsi\n\t"
+	             "movq 32(%r10), %r12\n\t"
+	             "movq 40(%r10), %r13\n\t"
+	             "movq 48(%r10), %r14\n\t"
+	             "movq 56(%r10), %r15\n\t"
+	             "movq 64(%r10), %rsp\n\t"
+	             "jmp *%r11\n");
 }
 #else
 static int FiberSaveContext(FiberCpuContext* ctx) {
@@ -2534,52 +2467,43 @@ static int FiberSaveContext(FiberCpuContext* ctx) {
 	return 0;
 }
 
-[[noreturn]] static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
+static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 	(void)ctx;
 	(void)ret;
 	EXIT("Fiber context switching is only implemented on x86_64\n");
 }
 #endif
 
-[[noreturn]] static void FiberStartTrampoline();
+[[noreturn]] static KYTY_SYSV_ABI void FiberStartTrampoline(FiberObject* fiber);
 
-[[noreturn]] static void FiberStartOnGuestStack(FiberObject* fiber) {
+[[noreturn]] static KYTY_SYSV_ABI void FiberStartOnGuestStack(FiberObject* fiber) {
 	FiberCpuContext ctx {};
 	const auto      stack_top = reinterpret_cast<uintptr_t>(fiber->addr_context) +
 	                            static_cast<uintptr_t>(fiber->size_context);
 	auto            rsp       = (stack_top & ~static_cast<uintptr_t>(0x0f));
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	rsp -= 4u * sizeof(uint64_t);
-#endif
 	rsp -= sizeof(uint64_t);
 	*reinterpret_cast<uint64_t*>(rsp) = 0;
 
 	ctx.rsp = rsp;
 	ctx.rip = reinterpret_cast<uint64_t>(&FiberStartTrampoline);
+	ctx.rdi = reinterpret_cast<uint64_t>(fiber);
 
-	g_starting_fiber = fiber;
 	FiberRestoreContext(&ctx, 1);
 }
 
-[[noreturn]] static void FiberStartTrampoline() {
-	auto* fiber      = g_starting_fiber;
-	g_starting_fiber = nullptr;
-	if (fiber == nullptr) {
-		EXIT("Fiber start without current fiber\n");
-	}
-
-	FiberCommitDeferredIdle();
-	FiberSetCurrentFiber(fiber);
+[[noreturn]] static KYTY_SYSV_ABI void FiberStartTrampoline(FiberObject* fiber) {
+	FiberCompleteSwitch(fiber);
 
 	fiber->entry(fiber->arg_on_initialize, fiber->arg_on_run);
 
 	FiberStoreState(fiber, FIBER_STATE_TERMINATED);
 	FiberSetContextValid(fiber, false);
 	fiber->arg_on_return  = 0;
-	g_thread_return_fiber = fiber;
-	FiberSetCurrentFiber(nullptr);
+	auto* context = FiberGetThreadContext();
+	context->returned_fiber = fiber;
+	context->current_fiber = nullptr;
 
-	FiberRestoreContext(&g_thread_fiber_context, 1);
+	FiberRestoreContext(&context->cpu_context, 1);
 }
 
 int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, FiberEntry entry,
@@ -2689,34 +2613,39 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	if (!FiberIsValid(fiber)) {
 		return FIBER_ERROR_INVALID;
 	}
-	if (g_current_fiber != nullptr) {
+	if (FiberGetThreadContext() != nullptr) {
 		return FIBER_ERROR_PERMISSION;
 	}
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_RUNNING)) {
 		return FIBER_ERROR_STATE;
 	}
 
-	fiber->arg_on_run     = arg_on_run;
-	fiber->arg_on_return  = 0;
-	g_thread_return_fiber = nullptr;
+	fiber->arg_on_run    = arg_on_run;
+	fiber->arg_on_return = 0;
+	// Register on the host stack; switching fibers only reads the native TLS slot.
+	FiberThreadContext context {};
+	FiberSetThreadContext(&context);
 
-	if (FiberSaveContext(&g_thread_fiber_context) == 0) {
+	if (FiberSaveContext(&context.cpu_context) == 0) {
 		if (fiber->context_valid) {
 			FiberRestoreContext(&fiber->saved_context, 1);
 		}
 		FiberStartOnGuestStack(fiber);
 	}
 
-	FiberCommitDeferredIdle();
-	FiberSetCurrentFiber(nullptr);
-	auto* returned_fiber  = (g_thread_return_fiber != nullptr ? g_thread_return_fiber : fiber);
-	g_thread_return_fiber = nullptr;
+	auto* returned_fiber  = (context.returned_fiber != nullptr ? context.returned_fiber : fiber);
+	const auto return_value = returned_fiber->arg_on_return;
+	const auto return_code =
+	    FiberLoadState(returned_fiber) == FIBER_STATE_TERMINATED ? FIBER_ERROR_STATE : OK;
+	// Copy results before another thread can acquire and resume the fiber.
+	FiberCompleteSwitch(nullptr);
+	FiberSetThreadContext(nullptr);
 
 	if (arg_on_return != nullptr) {
-		*arg_on_return = returned_fiber->arg_on_return;
+		*arg_on_return = return_value;
 	}
 
-	return (FiberLoadState(returned_fiber) == FIBER_STATE_TERMINATED ? FIBER_ERROR_STATE : OK);
+	return return_code;
 }
 
 int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
@@ -2726,38 +2655,30 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 	if (!FiberIsValid(fiber)) {
 		return FIBER_ERROR_INVALID;
 	}
-	if (g_current_fiber == nullptr) {
+	auto* context = FiberGetThreadContext();
+	if (context == nullptr) {
 		return FIBER_ERROR_PERMISSION;
 	}
 
-	for (;;) {
-		uint32_t observed_state = 0;
-		if (FiberWaitAndEnterRunning(fiber, &observed_state)) {
-			break;
-		}
-		if (FiberRepairStaleRunningOnThisThread(fiber, observed_state)) {
-			continue;
-		}
+	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_RUNNING)) {
 		return FIBER_ERROR_STATE;
 	}
 
-	auto* caller = g_current_fiber;
+	auto* caller = context->current_fiber;
 
 	fiber->arg_on_run    = arg_on_run;
 	fiber->arg_on_return = 0;
 
 	if (FiberSaveContext(&caller->saved_context) == 0) {
 		FiberSetContextValid(caller, true);
-		FiberDeferIdle(caller);
+		context->pending_idle_fiber = caller;
 		if (fiber->context_valid) {
 			FiberRestoreContext(&fiber->saved_context, 1);
 		}
 		FiberStartOnGuestStack(fiber);
 	}
 
-	FiberCommitDeferredIdle();
-	FiberSetCurrentFiber(caller);
-	FiberStoreState(caller, FIBER_STATE_RUNNING);
+	FiberCompleteSwitch(caller);
 
 	if (arg_on_return != nullptr) {
 		*arg_on_return = caller->arg_on_run;
@@ -2773,7 +2694,8 @@ int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject** fiber) {
 		return FIBER_ERROR_NULL;
 	}
 
-	*fiber = g_current_fiber;
+	const auto* context = FiberGetThreadContext();
+	*fiber = context != nullptr ? context->current_fiber : nullptr;
 
 	return OK;
 }
@@ -2781,23 +2703,22 @@ int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject** fiber) {
 int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_on_run) {
 	PRINT_NAME();
 
-	if (g_current_fiber == nullptr) {
+	auto* context = FiberGetThreadContext();
+	if (context == nullptr) {
 		return FIBER_ERROR_PERMISSION;
 	}
 
-	auto* fiber          = g_current_fiber;
+	auto* fiber          = context->current_fiber;
 	fiber->arg_on_return = arg_on_return;
 
 	if (FiberSaveContext(&fiber->saved_context) == 0) {
 		FiberSetContextValid(fiber, true);
-		g_thread_return_fiber = fiber;
-		FiberDeferIdle(fiber);
-		FiberRestoreContext(&g_thread_fiber_context, 1);
+		context->returned_fiber = fiber;
+		context->pending_idle_fiber = fiber;
+		FiberRestoreContext(&context->cpu_context, 1);
 	}
 
-	FiberCommitDeferredIdle();
-	FiberSetCurrentFiber(fiber);
-	FiberStoreState(fiber, FIBER_STATE_RUNNING);
+	FiberCompleteSwitch(fiber);
 	if (arg_on_run != nullptr) {
 		*arg_on_run = fiber->arg_on_run;
 	}
@@ -2997,6 +2918,21 @@ int KYTY_SYSV_ABI KernelAioSubmitWriteCommands(KernelAioRwRequest* req, int32_t 
 	return OK;
 }
 
+int KYTY_SYSV_ABI KernelAioPollRequest(int32_t id, int32_t* state) {
+	PRINT_NAME();
+
+	if (state == nullptr) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+
+	if (!kernel_aio_is_valid_id(id)) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	*state = g_kernel_aio_state[id].load(std::memory_order_acquire);
+	return OK;
+}
+
 int KYTY_SYSV_ABI KernelAioWaitRequest(int32_t id, int32_t* state, uint32_t* usec) {
 	PRINT_NAME();
 
@@ -3048,9 +2984,9 @@ namespace EventQueue = LibKernel::EventQueue;
 namespace EventFlag  = LibKernel::EventFlag;
 namespace Semaphore  = LibKernel::Semaphore;
 
-LIB_DEFINE(InitFiber_1) {
-	LIB_USING(Fiber);
+namespace Fiber {
 
+LIB_DEFINE(InitFiber_1) {
 	LIB_FUNC("hVYD7Ou2pCQ", Fiber::FiberInitialize);
 	LIB_FUNC("7+OJIpko9RY", Fiber::FiberInitializeInternal);
 	LIB_FUNC("asjUJJ+aa8s", Fiber::FiberOptParamInitialize);
@@ -3068,12 +3004,16 @@ LIB_DEFINE(InitFiber_1) {
 	LIB_FUNC("0dy4JtMUcMQ", Fiber::FiberGetThreadFramePointerAddress);
 }
 
-LIB_DEFINE(InitCoredump_1) {
-	LIB_USING(Coredump);
+} // namespace Fiber
 
+namespace Coredump {
+
+LIB_DEFINE(InitCoredump_1) {
 	LIB_FUNC("8zLSfEfW5AU", Coredump::sceCoredumpRegisterCoredumpHandler);
 	LIB_FUNC("fFkhOgztiCA", Coredump::sceCoredumpUnregisterCoredumpHandler);
 }
+
+} // namespace Coredump
 
 LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("1G3lF1Gg1k8", FileSystem::KernelOpen);
@@ -3098,6 +3038,8 @@ LIB_DEFINE(InitLibKernel_1_Mem) {
 	LIB_FUNC("mL8NDH86iQI", Memory::KernelMapNamedFlexibleMemory);
 	LIB_FUNC("IWIBBdTHit4", Memory::KernelMapFlexibleMemory);
 	LIB_FUNC("DGMG3JshrZU", Memory::KernelSetVirtualRangeName);
+	LIB_FUNC("mkgXxsoxWHg", Memory::KernelClearVirtualRangeName);
+	// 6xx
 	LIB_FUNC("4h6F1LLbTiw", Memory::KernelMapFlexibleMemory);
 	LIB_FUNC("cQke9UuBQOk", Memory::KernelMunmap);
 	LIB_FUNC("pO96TwzOm5E", Memory::KernelGetDirectMemorySize);
@@ -3249,6 +3191,9 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("mqdNorrB+gI", LibKernel::PthreadRwlockWrlock);
 	LIB_FUNC("sIlRvQqsN2Y", LibKernel::PthreadRwlockWrlock);
 	LIB_FUNC("bIHoZCTomsI", LibKernel::PthreadRwlockTrywrlock);
+	LIB_FUNC("XD3mDeybCnk", LibKernel::PthreadRwlockTryrdlock);
+	LIB_FUNC("iPtZRWICjrM", LibKernel::PthreadRwlockTimedrdlock);
+	LIB_FUNC("adh--6nIqTk", LibKernel::PthreadRwlockTimedwrlock);
 	LIB_FUNC("i2ifZ3fS2fo", LibKernel::PthreadRwlockattrDestroy);
 	LIB_FUNC("yOfGg-I1ZII", LibKernel::PthreadRwlockattrInit);
 	LIB_FUNC("qsdmgXjqSgk", LibKernel::PthreadRwlockattrDestroy);
@@ -3299,14 +3244,11 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("mqQMh1zPPT8", Posix::fstat);
 
 	LIB_FUNC("z0dtnPxYgtg", chmod);
-	LIB_FUNC("VAzswvTOCzI", Posix::unlink);
-	LIB_FUNC("NN01qLRhiqU", Posix::rename);
-	LIB_FUNC("c7ZnT7V1B98", Posix::rmdir);
-	LIB_FUNC("juWbTNM+8hw", Posix::fsync);
+	LIB_FUNC("VAzswvTOCzI", FileSystem::KernelUnlink);
 	LIB_FUNC("JGMio+21L4c", Posix::mkdir);
-	LIB_FUNC("wuCroIGjt2g", LibKernel::open);
-	LIB_FUNC("bY-PO6JhzhQ", LibKernel::close);
-	LIB_FUNC("FN4gaPmuFV8", LibKernel::write);
+	LIB_FUNC("wuCroIGjt2g", FileSystem::KernelOpen);
+	LIB_FUNC("bY-PO6JhzhQ", FileSystem::KernelClose);
+	LIB_FUNC("FN4gaPmuFV8", FileSystem::KernelWrite);
 }
 
 static void AddLibkernelUnityFunc(Loader::SymbolDatabase* s, const char* nid, uint64_t func,
@@ -3323,6 +3265,7 @@ static void AddLibkernelUnityFunc(Loader::SymbolDatabase* s, const char* nid, ui
 }
 
 LIB_DEFINE(InitLibKernel_1) {
+	LIB_FUNC("04AjkP0jO9U", Posix::UmtxOp);
 	InitLibKernel_1_FS(s);
 	InitLibKernel_1_Mem(s);
 	InitLibKernel_1_Equeue(s);
@@ -3347,6 +3290,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("8OnWXlgQlvo", LibKernel::KernelRtldThreadAtexitDecrement);
 	LIB_FUNC("959qrazPIrg", LibKernel::KernelGetProcParam);
 	LIB_FUNC("tU5e3f9gSiU", LibKernel::KernelIsTrinityMode);
+	LIB_FUNC("NH6xARDOVv8", LibKernel::KernelGetOperationMode);
 	LIB_FUNC("fTx66l5iWIA", LibKernel::KernelFsync);
 	LIB_FUNC("uvT2iYBBnkY", LibKernel::KernelSync);
 	LIB_FUNC("HoLVWNanBBc", LibKernel::getpid);
@@ -3367,6 +3311,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("lLMT9vJAck0", LibKernel::clock_gettime);
 	LIB_FUNC("5TgME6AYty4", KernelAioDeleteRequest);
 	LIB_FUNC("HgX7+AORI58", KernelAioSubmitReadCommands);
+	LIB_FUNC("2pOuoWoCxdk", KernelAioPollRequest);
 	LIB_FUNC("KOF-oJbQVvc", KernelAioWaitRequest);
 	LIB_FUNC("XQ8C8y+de+E", KernelAioSubmitWriteCommands);
 	LIB_FUNC("nu4a0-arQis", KernelAioInitializeParam);

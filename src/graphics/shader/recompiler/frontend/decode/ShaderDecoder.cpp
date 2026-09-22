@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
+#include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/decode/ExportOps.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 #include "graphics/shader/recompiler/frontend/decode/MemoryOps.h"
@@ -13,34 +14,11 @@
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
 
-uint32_t FloatBits(float value) {
-	return std::bit_cast<uint32_t>(value);
-}
-
-void SetError(std::string* error, const char* message) {
-	if (error != nullptr) {
-		*error = message;
-	}
-}
-
 bool HasLiteral(const Instruction& inst) {
 	return inst.src0.kind == OperandKind::LiteralConstant ||
 	       inst.src1.kind == OperandKind::LiteralConstant ||
 	       inst.src2.kind == OperandKind::LiteralConstant ||
 	       inst.src3.kind == OperandKind::LiteralConstant;
-}
-
-bool IsControlFlowBranch(Opcode opcode) {
-	switch (opcode) {
-		case Opcode::S_BRANCH:
-		case Opcode::S_CBRANCH_SCC0:
-		case Opcode::S_CBRANCH_SCC1:
-		case Opcode::S_CBRANCH_VCCZ:
-		case Opcode::S_CBRANCH_VCCNZ:
-		case Opcode::S_CBRANCH_EXECZ:
-		case Opcode::S_CBRANCH_EXECNZ: return true;
-		default: return false;
-	}
 }
 
 void ApplyLiteral(Operand& operand, uint32_t literal) {
@@ -52,7 +30,7 @@ void ApplyLiteral(Operand& operand, uint32_t literal) {
 
 std::string RawWordsToString(const Instruction& inst) {
 	std::string text;
-	for (uint32_t i = 0; i < inst.raw_count; i++) {
+	for (uint32_t i = 0; i < inst.word_count; i++) {
 		if (i != 0) {
 			text += " ";
 		}
@@ -140,6 +118,7 @@ std::string ImageSampleFlagsToString(uint32_t flags) {
 	AppendFlag(&text, &first, flags, ImageSampleFlagA16, "a16");
 	AppendFlag(&text, &first, flags, ImageSampleFlagCd, "cd");
 	AppendFlag(&text, &first, flags, ImageSampleFlagGatherHorizontal, "gather_horizontal");
+	AppendFlag(&text, &first, flags, ImageSampleFlagAdjust, "adjust");
 	return text;
 }
 
@@ -153,8 +132,15 @@ std::string FormatMimg(const Instruction& inst) {
 	                OperandToString(inst.dst).c_str(), OperandToString(inst.src0).c_str(),
 	                OperandToString(inst.src1).c_str(), OperandToString(inst.src2).c_str(),
 	                inst.dmask, ImageDimensionToString(inst.image_dimension));
+	if (inst.data_bits == 16u) {
+		text += " d16=1";
+	}
+	if (inst.image_r128) {
+		text += " r128=1";
+	}
 	switch (inst.opcode) {
 		case Opcode::IMAGE_SAMPLE:
+		case Opcode::IMAGE_GATHER4_L:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:
 		case Opcode::IMAGE_GATHER4_C_LZ:
@@ -196,6 +182,26 @@ std::string FormatExp(const Instruction& inst) {
 
 } // namespace
 
+bool IsConditionalBranch(Opcode opcode) {
+	switch (opcode) {
+		// DevKit NGG should be disabled.
+		case Opcode::S_CBRANCH_CDBGSYS: return false;
+		case Opcode::S_CBRANCH_SCC0:
+		case Opcode::S_CBRANCH_SCC1:
+		case Opcode::S_CBRANCH_VCCZ:
+		case Opcode::S_CBRANCH_VCCNZ:
+		case Opcode::S_CBRANCH_EXECZ:
+		case Opcode::S_CBRANCH_EXECNZ:
+		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
+		case Opcode::S_SUBVECTOR_LOOP_END: return true;
+		default: return false;
+	}
+}
+
+bool IsDirectBranch(Opcode opcode) {
+	return opcode == Opcode::S_BRANCH || IsConditionalBranch(opcode);
+}
+
 const char* ImageDimensionToString(ImageDimension dimension) {
 	switch (dimension) {
 		case ImageDimension::Dim1D: return "1d";
@@ -209,86 +215,74 @@ const char* ImageDimensionToString(ImageDimension dimension) {
 	}
 }
 
-bool DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand, std::string* error) {
+void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 	operand = {};
 
 	if (code <= 105u) {
 		operand.kind = OperandKind::Sgpr;
 		operand.reg  = code;
-		return true;
+		return;
 	}
 	if (code >= 128u && code <= 192u) {
 		operand.kind       = OperandKind::IntegerInlineConstant;
 		operand.signed_val = static_cast<int32_t>(code - 128u);
 		operand.value      = static_cast<uint32_t>(operand.signed_val);
-		return true;
+		return;
 	}
 	if (code >= 193u && code <= 208u) {
 		operand.kind       = OperandKind::IntegerInlineConstant;
 		operand.signed_val = 192 - static_cast<int32_t>(code);
 		operand.value      = static_cast<uint32_t>(operand.signed_val);
-		return true;
+		return;
 	}
 	if (code >= 240u && code <= 247u) {
 		constexpr float values[] = {0.5f, -0.5f, 1.0f, -1.0f, 2.0f, -2.0f, 4.0f, -4.0f};
 		operand.kind             = OperandKind::FloatInlineConstant;
-		operand.float_val        = values[code - 240u];
-		operand.value            = FloatBits(operand.float_val);
-		return true;
+		operand.value            = std::bit_cast<uint32_t>(values[code - 240u]);
+		return;
 	}
 	if (code >= 256u && code <= 511u) {
 		DecodeVectorGpr(code - 256u, operand);
-		return true;
+		return;
 	}
 
 	switch (code) {
-		case 106u: operand.kind = OperandKind::VccLo; return true;
-		case 107u: operand.kind = OperandKind::VccHi; return true;
-		case 124u: operand.kind = OperandKind::M0; return true;
-		case 125u: operand.kind = OperandKind::Null; return true;
-		case 126u: operand.kind = OperandKind::ExecLo; return true;
-		case 127u: operand.kind = OperandKind::ExecHi; return true;
-		case 239u: operand.kind = OperandKind::PopsExitingWaveId; return true;
+		case 106u: operand.kind = OperandKind::VccLo; return;
+		case 107u: operand.kind = OperandKind::VccHi; return;
+		case 124u: operand.kind = OperandKind::M0; return;
+		case 125u: operand.kind = OperandKind::Null; return;
+		case 126u: operand.kind = OperandKind::ExecLo; return;
+		case 127u: operand.kind = OperandKind::ExecHi; return;
+		case 239u: operand.kind = OperandKind::PopsExitingWaveId; return;
 		case 248u:
 			operand.kind      = OperandKind::FloatInlineConstant;
-			operand.float_val = 0.15915494309189535f;
-			operand.value     = FloatBits(operand.float_val);
-			return true;
-		case 251u: operand.kind = OperandKind::VccZ; return true;
-		case 252u: operand.kind = OperandKind::ExecZ; return true;
-		case 253u: operand.kind = OperandKind::Scc; return true;
-		case 255u: operand.kind = OperandKind::LiteralConstant; return true;
-		default:
-			if (error != nullptr) {
-				*error = fmt::format("unsupported scalar source operand 0x{:08x} at pc 0x{:08x}",
-				                     code, pc);
-			}
-			return false;
+			operand.value = std::bit_cast<uint32_t>(0.15915494309189535f);
+			return;
+		case 251u: operand.kind = OperandKind::VccZ; return;
+		case 252u: operand.kind = OperandKind::ExecZ; return;
+		case 253u: operand.kind = OperandKind::Scc; return;
+		case 255u: operand.kind = OperandKind::LiteralConstant; return;
+		default: EXIT("unsupported scalar source operand 0x%08x at pc 0x%08x", code, pc);
 	}
 }
 
-bool DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand, std::string* error) {
+void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
 	operand = {};
 
 	if (code <= 105u) {
 		operand.kind = OperandKind::Sgpr;
 		operand.reg  = code;
-		return true;
+		return;
 	}
 
 	switch (code) {
-		case 106u: operand.kind = OperandKind::VccLo; return true;
-		case 107u: operand.kind = OperandKind::VccHi; return true;
-		case 124u: operand.kind = OperandKind::M0; return true;
-		case 125u: operand.kind = OperandKind::Null; return true;
-		case 126u: operand.kind = OperandKind::ExecLo; return true;
-		case 127u: operand.kind = OperandKind::ExecHi; return true;
-		default:
-			if (error != nullptr) {
-				*error = fmt::format(
-				    "unsupported scalar destination operand 0x{:08x} at pc 0x{:08x}", code, pc);
-			}
-			return false;
+		case 106u: operand.kind = OperandKind::VccLo; return;
+		case 107u: operand.kind = OperandKind::VccHi; return;
+		case 124u: operand.kind = OperandKind::M0; return;
+		case 125u: operand.kind = OperandKind::Null; return;
+		case 126u: operand.kind = OperandKind::ExecLo; return;
+		case 127u: operand.kind = OperandKind::ExecHi; return;
+		default: EXIT("unsupported scalar destination operand 0x%08x at pc 0x%08x", code, pc);
 	}
 }
 
@@ -315,8 +309,7 @@ void ReadLiteralOperands(std::span<const uint32_t> code, uint32_t word_index, In
 void SetRawWords(Instruction& inst, std::span<const uint32_t> code, uint32_t word_index,
                  uint32_t word_count) {
 	inst.word_count = word_count;
-	inst.raw_count  = word_count;
-	for (uint32_t i = 0; i < inst.raw_count; i++) {
+	for (uint32_t i = 0; i < inst.word_count; i++) {
 		inst.raw[i] = code[word_index + i];
 	}
 }
@@ -361,39 +354,52 @@ Family GetInstructionFamily(uint32_t word) {
 	}
 }
 
-bool DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst,
-                       std::string* error) {
+void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst) {
 	const uint32_t pc = word_index * sizeof(uint32_t);
 	switch (GetInstructionFamily(code[word_index])) {
-		case Family::SOP1: return DecodeSop1(pc, code, word_index, inst, error);
-		case Family::SOP2: return DecodeSop2(pc, code, word_index, inst, error);
-		case Family::SOPK: return DecodeSopk(pc, code, word_index, inst, error);
-		case Family::SOPC: return DecodeSopc(pc, code, word_index, inst, error);
-		case Family::SOPP: DecodeSopp(pc, code, word_index, inst); return true;
-		case Family::VOP1: return DecodeVop1(pc, code, word_index, inst, error);
-		case Family::VOP2: return DecodeVop2(pc, code, word_index, inst, error);
-		case Family::VOP3: return DecodeVop3(pc, code, word_index, inst, error);
-		case Family::VOP3P: return DecodeVop3p(pc, code, word_index, inst, error);
-		case Family::VOPC: return DecodeVopc(pc, code, word_index, inst, error);
-		case Family::VINTRP: DecodeVintrp(pc, code, word_index, inst); return true;
-		case Family::SMEM: DecodeSmem(pc, code, word_index, inst); return true;
-		case Family::MUBUF: DecodeMubuf(pc, code, word_index, inst); return true;
-		case Family::MTBUF: DecodeMtbuf(pc, code, word_index, inst); return true;
-		case Family::FLAT: DecodeFlat(pc, code, word_index, inst); return true;
-		case Family::DS: DecodeDs(pc, code, word_index, inst); return true;
-		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); return true;
-		case Family::EXP: DecodeExp(pc, code, word_index, inst); return true;
+		case Family::SOP1: DecodeSop1(pc, code, word_index, inst); return;
+		case Family::SOP2: DecodeSop2(pc, code, word_index, inst); return;
+		case Family::SOPK: DecodeSopk(pc, code, word_index, inst); return;
+		case Family::SOPC: DecodeSopc(pc, code, word_index, inst); return;
+		case Family::SOPP: DecodeSopp(pc, code, word_index, inst); return;
+		case Family::VOP1: DecodeVop1(pc, code, word_index, inst); return;
+		case Family::VOP2: DecodeVop2(pc, code, word_index, inst); return;
+		case Family::VOP3: DecodeVop3(pc, code, word_index, inst); return;
+		case Family::VOP3P: DecodeVop3p(pc, code, word_index, inst); return;
+		case Family::VOPC: DecodeVopc(pc, code, word_index, inst); return;
+		case Family::VINTRP: DecodeVintrp(pc, code, word_index, inst); return;
+		case Family::SMEM: DecodeSmem(pc, code, word_index, inst); return;
+		case Family::MUBUF: DecodeMubuf(pc, code, word_index, inst); return;
+		case Family::MTBUF: DecodeMtbuf(pc, code, word_index, inst); return;
+		case Family::FLAT: DecodeFlat(pc, code, word_index, inst); return;
+		case Family::DS: DecodeDs(pc, code, word_index, inst); return;
+		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); return;
+		case Family::EXP: DecodeExp(pc, code, word_index, inst); return;
 		default:
-			if (error != nullptr) {
-				*error =
-				    fmt::format("unknown RDNA2 instruction family at pc 0x{:08x}, raw=0x{:08x}", pc,
-				                code[word_index]);
-			}
-			return false;
+			EXIT("unknown RDNA2 instruction family at pc 0x%08x, raw=0x%08x", pc, code[word_index]);
 	}
 }
 
-bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string* error) {
+Program DecodeFrontProgram(std::span<const uint32_t> front) {
+	Program  result;
+	uint32_t front_words = 0;
+	while (front_words < front.size()) {
+		auto& inst = result.instructions.emplace_back();
+		DecodeInstruction(front, front_words, inst);
+		front_words += inst.word_count;
+		if (inst.opcode == Opcode::S_SETPC_B64) {
+			EXIT_NOT_IMPLEMENTED(inst.src0.kind != OperandKind::Sgpr || inst.src0.reg != 6u);
+			break;
+		}
+		EXIT_NOT_IMPLEMENTED(inst.opcode == Opcode::S_ENDPGM);
+	}
+	EXIT_IF(result.instructions.empty() ||
+	        result.instructions.back().opcode != Opcode::S_SETPC_B64);
+	result.code = front.first(front_words);
+	return result;
+}
+
+void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 	program.instructions.clear();
 	program.instructions.reserve(code.size());
 	program.code = code;
@@ -401,15 +407,12 @@ bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string
 	std::vector<bool> branch_targets;
 	for (uint32_t word_index = 0; word_index < code.size();) {
 		program.instructions.emplace_back();
-		if (!DecodeInstruction(code, word_index, program.instructions.back(), error)) {
-			program.instructions.pop_back();
-			return false;
-		}
+		DecodeInstruction(code, word_index, program.instructions.back());
 
 		const auto& inst = program.instructions.back();
 		word_index += inst.word_count;
 
-		if (IsControlFlowBranch(inst.opcode)) {
+		if (IsDirectBranch(inst.opcode)) {
 			const auto target_index = inst.branch_target / sizeof(uint32_t);
 			if (branch_targets.empty()) {
 				branch_targets.resize(code.size());
@@ -418,12 +421,11 @@ bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string
 		}
 		if (inst.opcode == Opcode::S_ENDPGM &&
 		    (word_index >= code.size() || branch_targets.empty() || !branch_targets[word_index])) {
-			return true;
+			return;
 		}
 	}
 
-	SetError(error, "shader decode reached the code boundary before S_ENDPGM");
-	return false;
+	EXIT("shader decode reached the code boundary before S_ENDPGM");
 }
 
 std::string OperandToString(const Operand& operand) {
@@ -433,7 +435,9 @@ std::string OperandToString(const Operand& operand) {
 		case OperandKind::IntegerInlineConstant:
 			text = fmt::format("{}", operand.signed_val);
 			break;
-		case OperandKind::FloatInlineConstant: text = fmt::format("{:f}", operand.float_val); break;
+		case OperandKind::FloatInlineConstant:
+			text = fmt::format("{:f}", std::bit_cast<float>(operand.value));
+			break;
 		case OperandKind::Sgpr: text = fmt::format("s{}", operand.reg); break;
 		case OperandKind::Vgpr: text = fmt::format("v{}", operand.reg); break;
 		case OperandKind::VccLo: text = "vcc_lo"; break;
@@ -468,8 +472,9 @@ std::string OperandToString(const Operand& operand) {
 		text += ".clamp";
 	}
 	if (operand.dpp) {
-		text += fmt::format(".dpp(ctrl=0x{:x},fi={},bc={})", operand.dpp_ctrl,
-		                    operand.dpp_fetch_inactive ? 1u : 0u, operand.dpp_bound_ctrl ? 1u : 0u);
+		text += fmt::format(".{}(ctrl=0x{:x},fi={},bc={})", operand.dpp8 ? "dpp8" : "dpp",
+		                    operand.dpp_ctrl, operand.dpp_fetch_inactive ? 1u : 0u,
+		                    operand.dpp_bound_ctrl ? 1u : 0u);
 	}
 	return text;
 }
@@ -487,6 +492,7 @@ std::string InstructionToString(const Instruction& inst) {
 	switch (inst.opcode) {
 		case Opcode::S_MOV_B32:
 		case Opcode::S_MOV_B64:
+		case Opcode::S_CMOV_B64:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, {}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               OperandToString(inst.dst).c_str(),
@@ -494,11 +500,17 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_ABS_I32:
 		case Opcode::S_BREV_B32:
 		case Opcode::S_BCNT1_I32_B32:
+		case Opcode::S_FLBIT_I32_B32:
 		case Opcode::S_FF1_I32_B32:
 		case Opcode::S_FF1_I32_B64:
+		case Opcode::S_BITSET0_B64:
+		case Opcode::S_BITSET1_B64:
 		case Opcode::S_NOT_B64:
+		case Opcode::S_WQM_B32:
 		case Opcode::S_WQM_B64:
+		case Opcode::S_QUADMASK_B64:
 		case Opcode::S_AND_SAVEEXEC_B32:
+		case Opcode::S_ORN2_SAVEEXEC_B32:
 		case Opcode::S_ANDN1_SAVEEXEC_B32:
 		case Opcode::S_AND_SAVEEXEC_B64:
 		case Opcode::S_ORN2_SAVEEXEC_B64:
@@ -521,6 +533,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_WAITCNT:
 		case Opcode::S_WAITCNT_DEPCTR:
 		case Opcode::S_SLEEP:
+		case Opcode::S_SETPRIO:
 		case Opcode::S_TRAP:
 		case Opcode::S_SENDMSG:
 		case Opcode::S_TTRACEDATA:
@@ -541,13 +554,20 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_CBRANCH_VCCNZ:
 		case Opcode::S_CBRANCH_EXECZ:
 		case Opcode::S_CBRANCH_EXECNZ:
+		case Opcode::S_CBRANCH_CDBGSYS:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} 0x{:08x}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               inst.branch_target));
+		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
+		case Opcode::S_SUBVECTOR_LOOP_END:
+			return WithUnsupportedReason(inst, fmt::format(
+			    "0x{:08x}: {} {}, 0x{:08x}", inst.pc, magic_enum::enum_name(inst.opcode),
+			    OperandToString(inst.dst), inst.branch_target));
 		case Opcode::EXP: return WithUnsupportedReason(inst, FormatExp(inst));
 		case Opcode::IMAGE_SAMPLE:
 		case Opcode::IMAGE_STORE:
 		case Opcode::IMAGE_STORE_MIP:
+		case Opcode::IMAGE_ATOMIC_SWAP:
 		case Opcode::IMAGE_ATOMIC_ADD:
 		case Opcode::IMAGE_ATOMIC_UMIN:
 		case Opcode::IMAGE_ATOMIC_UMAX:
@@ -558,6 +578,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
 		case Opcode::IMAGE_GET_LOD:
+		case Opcode::IMAGE_GATHER4_L:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:
 		case Opcode::IMAGE_GATHER4_C_LZ:
@@ -604,6 +625,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::TBUFFER_STORE_FORMAT_XYZ:
 		case Opcode::TBUFFER_STORE_FORMAT_XYZW:
 		case Opcode::BUFFER_ATOMIC_SWAP:
+		case Opcode::BUFFER_ATOMIC_CMPSWAP:
+		case Opcode::BUFFER_ATOMIC_SWAP_X2:
 		case Opcode::BUFFER_ATOMIC_ADD:
 		case Opcode::BUFFER_ATOMIC_SUB:
 		case Opcode::BUFFER_ATOMIC_SMIN:
@@ -612,6 +635,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_ATOMIC_UMAX:
 		case Opcode::BUFFER_ATOMIC_AND:
 		case Opcode::BUFFER_ATOMIC_OR:
+		case Opcode::BUFFER_ATOMIC_OR_X2:
 		case Opcode::BUFFER_ATOMIC_XOR:
 		case Opcode::BUFFER_ATOMIC_FMIN:
 		case Opcode::BUFFER_ATOMIC_FMAX:
@@ -635,6 +659,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_ADD_RTN_U32:
 		case Opcode::DS_SUB_U32:
 		case Opcode::DS_SUB_RTN_U32:
+		case Opcode::DS_INC_RTN_U32:
+		case Opcode::DS_DEC_RTN_U32:
 		case Opcode::DS_MIN_I32:
 		case Opcode::DS_MIN_RTN_I32:
 		case Opcode::DS_MAX_I32:
@@ -653,11 +679,13 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32:
 		case Opcode::DS_SWIZZLE_B32:
+		case Opcode::DS_BPERMUTE_B32:
 		case Opcode::DS_READ_I8:
 		case Opcode::DS_READ_U8:
 		case Opcode::DS_READ_I16:
 		case Opcode::DS_READ_U16:
 		case Opcode::DS_READ2_B32:
+		case Opcode::DS_READ2ST64_B32:
 		case Opcode::DS_READ_B32:
 		case Opcode::DS_READ_B64:
 		case Opcode::DS_READ2_B64:
@@ -666,6 +694,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_READ_B128:
 		case Opcode::DS_WRITE_B8:
 		case Opcode::DS_WRITE_B16:
+		case Opcode::DS_WRITE_B16_D16_HI:
 		case Opcode::DS_WRITE2_B32:
 		case Opcode::DS_WRITE2ST64_B32:
 		case Opcode::DS_WRITE2_B64:

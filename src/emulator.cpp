@@ -15,6 +15,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "kytyGitVersion.h"
 #include "libs/agc.h"
 #include "libs/audio.h"
 #include "libs/controller.h"
@@ -26,16 +27,34 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <thread>
 
 namespace Emulator {
 
 static void PrintSystemInfo() {
-	Common::SystemInfo info = Common::GetSystemInfo();
+	const Common::SystemInfo info = Common::GetSystemInfo();
 
-	LOGF("ProcessorName = %s\n", info.ProcessorName.c_str());
+#if defined(__APPLE__)
+	static constexpr auto platform_name = "macOS";
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	static constexpr auto platform_name = "Windows";
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	static constexpr auto platform_name = "Linux";
+#else
+	static constexpr auto platform_name = "Unknown";
+#endif
+
+	LOGF("Build\n"
+	     "  version: %s\n\n"
+	     "Host\n"
+	     "  os:      %s\n"
+	     "  cpu:     %s\n"
+	     "  threads: %u\n\n",
+	     KYTY_BUILD_LABEL, platform_name, info.ProcessorName.c_str(),
+	     std::thread::hardware_concurrency());
 }
 
-static void ShutdownAtExit() {
+static void KytyClose() {
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
 	rt->Clear();
@@ -120,6 +139,7 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 		}
 	}
 
+	// Initialization order is explicit; destruction is automatic and reversed.
 	subsystems.Initialize<Loader::Timer::Lifecycle>();
 	subsystems.Initialize<Libs::LibKernel::PthreadLifecycle>();
 	subsystems.Initialize<Profiler::Lifecycle>();
@@ -153,11 +173,7 @@ static void Execute(const std::filesystem::path& game_patch) {
 	Common::Thread guest_thread(
 	    [](void* param) {
 		    auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
-		    std::printf("Magnus:Guest:Info: entry thread started\n");
-		    std::fflush(stdout);
 		    rt->Execute(*static_cast<const std::filesystem::path*>(param));
-		    std::printf("Magnus:Guest:Error: entry thread returned, no guest is running\n");
-		    std::fflush(stdout);
 	    },
 	    &patch_path);
 	Libs::Graphics::WindowRun();
@@ -180,8 +196,16 @@ void Run(const RunOptions& options) {
 	ClearDebugTextureFolder();
 
 	PrintSystemInfo();
+	std::string title_id;
+	if (Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) && !title_id.empty()) {
+		Log::WriteToConsoleAndLog(fmt::format("Title ID: {}\n", title_id));
+	}
 
-	int ok = atexit(ShutdownAtExit);
+	int ok = atexit(KytyClose);
+	EXIT_NOT_IMPLEMENTED(ok != 0);
+
+	// Guest threads are still running, so skip KytyClose() and only flush emergency state.
+	ok = at_quick_exit(Common::Subsystems::EmergencyShutdownActive);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
 
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0");
